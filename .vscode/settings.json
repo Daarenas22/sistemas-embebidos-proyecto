@@ -1,0 +1,13 @@
+{
+ "antigravity.terminal.executionPolicy": "requestReview",
+ "antigravity.skipPermissions": false,
+ "antigravity.allowList": [
+ "pio run",
+ "pio check",
+ "pio device list"
+ ],
+ "antigravity.denyList": [
+ "pio run -t erase",
+ "esptool.py erase_flash"
+ ]
+}

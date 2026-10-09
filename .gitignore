@@ -1,0 +1,25 @@
+# Entorno virtual de Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Archivos con claves secretas y credenciales
+.env
+*.json
+
+# Archivos temporales de PlatformIO y VS Code
+.pio/
+.vscode/*
+!.vscode/settings.json
+
+# Ignorar entornos virtuales y compilaciones
+venv/
+.pio/
+
+# Ignorar claves secretas (¡Muy importante!)
+.env
+__pycache__/
+
+# Ignorar fotos de prueba
+*.jpg
