@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auditoría Eléctrica – Sistema Embebido</title>
+    <style>
+        :root {
+            --bg: #0f1117;
+            --card: #1a1d27;
+            --border: #2a2d3a;
+            --accent: #4f8cff;
+            --accent2: #38d9a9;
+            --text: #e1e4ed;
+            --muted: #8b8fa3;
+            --danger: #ff6b6b;
+            --warn: #ffd43b;
+            --success: #51cf66;
+            --oled-bg: #080d08;
+            --oled-text: #39ff14;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        /* ── Header ─────────────────────────────── */
+        header {
+            background: linear-gradient(135deg, #1a1d27 0%, #252836 100%);
+            border-bottom: 1px solid var(--border);
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        header h1 {
+            font-size: 1.4rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: .5rem;
+        }
+
+        header h1 span.icon { font-size: 1.6rem; }
+
+        .header-meta {
+            display: flex;
+            align-items: center;
+            gap: 1.2rem;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: .4rem;
+            font-size: .85rem;
+            color: var(--muted);
+        }
+
+        .status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--danger);
+            transition: background .3s;
+        }
+
+        .status-dot.connected { background: var(--success); }
+
+        /* ── Layout ─────────────────────────────── */
+        .dashboard {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.2rem;
+            padding: 1.5rem 2rem;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        @media (max-width: 960px) {
+            .dashboard { grid-template-columns: 1fr; }
+        }
+
+        /* ── Cards ──────────────────────────────── */
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.2rem 1.4rem;
+            display: flex;
+            flex-direction: column;
+            gap: .8rem;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-title {
+            font-size: .82rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--muted);
+            display: flex;
+            align-items: center;
+            gap: .4rem;
+        }
+
+        .yolo-badge {
+            font-size: .75rem;
+            background: rgba(79, 140, 255, 0.15);
+            color: var(--accent);
+            border: 1px solid rgba(79, 140, 255, 0.35);
+            padding: .2rem .6rem;
+            border-radius: 20px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        /* ── Foto ───────────────────────────────── */
+        .foto-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #12141c;
+            min-height: 280px;
+            position: relative;
+        }
+
+        .foto-container img {
+            max-width: 100%;
+            max-height: 400px;
+            object-fit: contain;
+            border-radius: 6px;
+        }
+
+        .foto-placeholder {
+            color: var(--muted);
+            text-align: center;
+            font-size: .9rem;
+        }
+
+        .foto-placeholder .big-icon { font-size: 3rem; display: block; margin-bottom: .5rem; }
+
+        .foto-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: .75rem;
+            color: var(--muted);
+        }
+
+        /* ── Tabla FFT ──────────────────────────── */
+        .fft-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+        }
+
+        .fft-table th,
+        .fft-table td {
+            padding: .65rem .8rem;
+            text-align: left;
+        }
+
+        .fft-table th {
+            font-size: .75rem;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+            color: var(--muted);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .fft-table td {
+            font-size: 1rem;
+            font-variant-numeric: tabular-nums;
+            border-bottom: 1px solid rgba(255,255,255,.04);
+        }
+
+        .fft-table tr:last-child td { border-bottom: none; }
+
+        .fft-label { color: var(--text); font-weight: 500; }
+
+        .fft-value {
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .fft-value.thd { color: var(--warn); }
+
+        .fft-bar-cell { width: 40%; }
+
+        .fft-bar-bg {
+            height: 6px;
+            background: rgba(255,255,255,.06);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .fft-bar {
+            height: 100%;
+            border-radius: 3px;
+            background: var(--accent);
+            transition: width .5s ease;
+        }
+
+        .fft-bar.thd-bar { background: var(--warn); }
+
+        .no-data {
+            color: var(--muted);
+            font-size: .9rem;
+            padding: 2rem;
+            text-align: center;
+        }
+
+        /* ── Transcripción / Veredicto ──────────── */
+        .text-block {
+            background: #12141c;
+            border-radius: 8px;
+            padding: 1rem 1.2rem;
+            font-size: .95rem;
+            line-height: 1.6;
+            flex: 1;
+            min-height: 90px;
+            white-space: pre-wrap;
+            overflow-y: auto;
+            max-height: 320px;
+        }
+
+        .text-block.placeholder {
+            color: var(--muted);
+            font-style: italic;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .veredicto-block {
+            border-left: 3px solid var(--accent2);
+        }
+
+        /* ── Pantalla OLED Preview ──────────────── */
+        .oled-preview {
+            background: var(--oled-bg);
+            border: 2px solid #233323;
+            border-radius: 8px;
+            padding: .9rem 1.1rem;
+            font-family: 'Courier New', monospace;
+            font-size: .92rem;
+            color: var(--oled-text);
+            line-height: 1.4;
+            min-height: 75px;
+            white-space: pre-wrap;
+            box-shadow: inset 0 0 10px rgba(57, 255, 20, 0.15);
+            letter-spacing: .5px;
+        }
+
+        .oled-preview.placeholder {
+            color: #1a421a;
+            font-style: italic;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* ── Audio Player ───────────────────────── */
+        .audio-container {
+            display: flex;
+            align-items: center;
+            gap: .8rem;
+            margin-top: .4rem;
+        }
+
+        audio {
+            width: 100%;
+            height: 36px;
+            filter: invert(1) hue-rotate(180deg);
+        }
+
+        /* ── Animaciones ────────────────────────── */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        .fade-in { animation: fadeIn .4s ease; }
+
+        /* ── Footer ─────────────────────────────── */
+        footer {
+            text-align: center;
+            padding: 1.2rem;
+            font-size: .75rem;
+            color: var(--muted);
+            border-top: 1px solid var(--border);
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1><span class="icon">⚡</span> Auditoría Eléctrica – Pipeline IA</h1>
+    <div class="header-meta">
+        <div class="status-badge">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Desconectado</span>
+        </div>
+    </div>
+</header>
+
+<main class="dashboard">
+    <!-- FOTO CON YOLO -->
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">📷 Fotografía & Detección YOLOv8</div>
+            <div class="yolo-badge" id="yoloBadge">Sin detección</div>
+        </div>
+        <div class="foto-container" id="fotoContainer">
+            <div class="foto-placeholder" id="fotoPlaceholder">
+                <span class="big-icon">📷</span>
+                Esperando captura del ESP32-S3-CAM…
+            </div>
+        </div>
+        <div class="foto-footer">
+            <span id="yoloDetalle">Esperando inferencia…</span>
+            <span id="fotoTs"></span>
+        </div>
+    </div>
+
+    <!-- FFT -->
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">📊 Análisis Espectral (FFT)</div>
+        </div>
+        <div id="fftContent">
+            <div class="no-data">Esperando datos del ESP32-WROOM…</div>
+        </div>
+    </div>
+
+    <!-- TRANSCRIPCIÓN -->
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">🎤 Transcripción de Audio (Google STT)</div>
+        </div>
+        <div class="text-block placeholder" id="transcripcion">
+            Esperando consulta por voz desde el ESP32-WROOM…
+        </div>
+    </div>
+
+    <!-- PANTALLA OLED PREVIEW -->
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">📟 Respuesta Resumida (Pantalla OLED ESP32)</div>
+        </div>
+        <div class="oled-preview placeholder" id="resumenOled">
+            [PANTALLA OLED: EN ESPERA]
+        </div>
+    </div>
+
+    <!-- VEREDICTO GEMINI + AUDIO TTS -->
+    <div class="card" style="grid-column: 1 / -1;">
+        <div class="card-header">
+            <div class="card-title">🤖 Veredicto Gemini 1.5 Flash (Diagnóstico de Carga y Armónicos)</div>
+        </div>
+        <div class="text-block placeholder" id="veredicto">
+            Esperando veredicto multimodal de la IA…
+        </div>
+        <div class="audio-container" id="audioContainer" style="display: none;">
+            <audio id="audioPlayer" controls></audio>
+        </div>
+    </div>
+</main>
+
+<footer>
+    Sistema Embebido de Auditoría Eléctrica · YOLOv8n + Google STT + Gemini 1.5 Flash + gTTS
+</footer>
+
+<script>
+(function() {
+    const $ = id => document.getElementById(id);
+
+    const statusDot       = $('statusDot');
+    const statusText      = $('statusText');
+    const fotoContainer   = $('fotoContainer');
+    const fotoPlaceholder = $('fotoPlaceholder');
+    const fotoTs          = $('fotoTs');
+    const yoloBadge       = $('yoloBadge');
+    const yoloDetalle     = $('yoloDetalle');
+    const fftContent      = $('fftContent');
+    const transcripcionEl = $('transcripcion');
+    const veredictoEl     = $('veredicto');
+    const resumenOledEl   = $('resumenOled');
+    const audioContainer  = $('audioContainer');
+    const audioPlayer     = $('audioPlayer');
+
+    let ws;
+    let reconnectTimer;
+
+    function renderFoto(state) {
+        if (state.ultima_foto) {
+            const currentImg = fotoContainer.querySelector('img');
+            if (!currentImg || currentImg.dataset.ts !== state.ultima_foto_ts) {
+                fotoContainer.innerHTML =
+                    `<img src="${state.ultima_foto}" alt="Foto procesada" class="fade-in" data-ts="${state.ultima_foto_ts}">`;
+                fotoTs.textContent = `Captura: ${state.ultima_foto_ts || ''}`;
+            }
+        }
+        if (state.etiqueta_visual) {
+            yoloBadge.textContent = state.etiqueta_visual;
+            yoloDetalle.textContent = state.yolo_detalle || `Detectado: ${state.etiqueta_visual}`;
+        }
+    }
+
+    function renderFFT(state) {
+        if (!state.fft) return;
+        const f = state.fft;
+        const maxVal = Math.max(f.fundamental || 0, f.h3 || 0, f.h5 || 0, f.h7 || 0, 1);
+
+        const rows = [
+            { label: 'Fundamental',  value: f.fundamental, unit: 'Hz', cls: '', barCls: '' },
+            { label: '3er Armónico', value: f.h3,          unit: '',   cls: '', barCls: '' },
+            { label: '5to Armónico', value: f.h5,          unit: '',   cls: '', barCls: '' },
+            { label: '7mo Armónico', value: f.h7,          unit: '',   cls: '', barCls: '' },
+            { label: 'THD',          value: f.thd,         unit: '%',  cls: 'thd', barCls: 'thd-bar' },
+        ];
+
+        let html = `<table class="fft-table fade-in">
+            <thead><tr>
+                <th>Parámetro</th>
+                <th>Valor</th>
+                <th class="fft-bar-cell">Magnitud</th>
+            </tr></thead><tbody>`;
+
+        rows.forEach(r => {
+            const v = (r.value !== undefined && r.value !== null) ? Number(r.value) : 0;
+            const pct = r.label === 'THD' ? Math.min(v, 100) : (v / maxVal) * 100;
+            html += `<tr>
+                <td class="fft-label">${r.label}</td>
+                <td class="fft-value ${r.cls}">${v.toFixed(2)} ${r.unit}</td>
+                <td class="fft-bar-cell">
+                    <div class="fft-bar-bg"><div class="fft-bar ${r.barCls}" style="width:${pct}%"></div></div>
+                </td>
+            </tr>`;
+        });
+
+        html += `</tbody></table>`;
+        fftContent.innerHTML = html;
+    }
+
+    function renderTexto(el, text, placeholder) {
+        if (text) {
+            el.textContent = text;
+            el.classList.remove('placeholder');
+        } else {
+            el.textContent = placeholder;
+            if (!el.classList.contains('placeholder')) el.classList.add('placeholder');
+        }
+    }
+
+    function renderAudio(state) {
+        if (state.audio_tts_base64) {
+            const audioSrc = `data:audio/mp3;base64,${state.audio_tts_base64}`;
+            if (audioPlayer.src !== audioSrc) {
+                audioPlayer.src = audioSrc;
+                audioContainer.style.display = 'flex';
+            }
+        }
+    }
+
+    function render(state) {
+        if (!state) return;
+        renderFoto(state);
+        renderFFT(state);
+        renderTexto(transcripcionEl, state.transcripcion, 'Esperando consulta por voz desde el ESP32-WROOM…');
+        renderTexto(veredictoEl, state.veredicto, 'Esperando veredicto multimodal de la IA…');
+        renderTexto(resumenOledEl, state.resumen_oled, '[PANTALLA OLED: EN ESPERA]');
+
+        if (state.veredicto) {
+            veredictoEl.classList.add('veredicto-block');
+        }
+        renderAudio(state);
+    }
+
+    // ── WebSocket ────────────────────────────
+    function connect() {
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+        ws.onopen = () => {
+            statusDot.classList.add('connected');
+            statusText.textContent = 'Conectado';
+            clearTimeout(reconnectTimer);
+        };
+
+        ws.onmessage = (e) => {
+            try {
+                const state = JSON.parse(e.data);
+                render(state);
+            } catch(err) {
+                console.error('Error parsing WS message:', err);
+            }
+        };
+
+        ws.onclose = () => {
+            statusDot.classList.remove('connected');
+            statusText.textContent = 'Reconectando…';
+            reconnectTimer = setTimeout(connect, 2000);
+        };
+
+        ws.onerror = () => {
+            ws.close();
+        };
+    }
+
+    // Polling de respaldo cada 2 segundos
+    setInterval(async () => {
+        if (ws && ws.readyState === WebSocket.OPEN) return;
+        try {
+            const r = await fetch('/estado');
+            if (r.ok) render(await r.json());
+        } catch {}
+    }, 2000);
+
+    connect();
+    fetch('/estado').then(r => r.json()).then(render).catch(() => {});
+})();
+</script>
+</body>
+</html>

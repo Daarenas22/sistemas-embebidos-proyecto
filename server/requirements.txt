@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+python-multipart
+jinja2
+pillow
+gTTS
+google-genai
+ultralytics
+SpeechRecognition
