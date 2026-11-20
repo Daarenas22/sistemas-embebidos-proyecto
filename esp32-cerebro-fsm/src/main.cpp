@@ -28,6 +28,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Umbral de sonido calibrado para detección de audio
 #define SOUND_THRESHOLD 2200000
+#define TIEMPO_ESCUCHA_MS 4000 // 4 segundos para hacer la pregunta
+unsigned long inicioCapturaVoz = 0;
 
 // ====================================================================
 // --- MÓDULO DSP Y CONFIGURACIÓN FFT ---
@@ -338,24 +340,40 @@ void leerMicrofono() {
 }
 
 // --- PANTALLA: CAPTURA DE VOZ ---
-void dibujarPantallaMicrofono() {
+// --- PANTALLA: CAPTURA DE VOZ CON TEMPORIZADOR ---
+void dibujarPantallaMicrofono(unsigned long tiempoRestanteMs) {
   display.clearDisplay();
-
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+
+  // Encabezado con indicador activo y cuenta regresiva
   display.setCursor(0, 0);
-  display.println("ESTADO: ESCUCHANDO");
+  display.print("ESCUCHANDO");
+  
+  float segRestantes = tiempoRestanteMs / 1000.0;
+  display.setCursor(86, 0);
+  display.printf("%.1fs", segRestantes);
   display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
 
   leerMicrofono();
 
-  int anchoBarraOLED = map(constrain(amplitudPromedio, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 120);
-  display.drawRect(4, 13, 120, 10, SSD1306_WHITE);
-  if (anchoBarraOLED > 2) {
-    display.fillRect(6, 15, anchoBarraOLED - 4, 6, SSD1306_WHITE);
+  // Indicador de estado del micrófono (Detecta si hay señal activa)
+  display.setCursor(4, 13);
+  if (amplitudPromedio > 150000) { // Umbral bajo solo para confirmar que entra voz
+    display.print("MIC: [REC] Captando");
+  } else {
+    display.print("MIC: [ON]  Habla...");
   }
 
-  int histH = map(constrain(amplitudPromedio, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 20);
+  // Barra de nivel de volumen en tiempo real
+  int anchoBarraOLED = map(constrain(amplitudPromedio, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 120);
+  display.drawRect(4, 24, 120, 8, SSD1306_WHITE);
+  if (anchoBarraOLED > 2) {
+    display.fillRect(6, 26, anchoBarraOLED - 4, 4, SSD1306_WHITE);
+  }
+
+  // Historial gráfico inferior (espectrograma de barras)
+  int histH = map(constrain(amplitudPromedio, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 24);
   barHistory[barIndex] = histH;
   barIndex = (barIndex + 1) % BAR_HISTORY;
 
@@ -372,20 +390,7 @@ void dibujarPantallaMicrofono() {
   }
   display.drawLine(0, baseY, SCREEN_WIDTH - 1, baseY, SSD1306_WHITE);
 
-  int porcentaje = (int)((constrain(amplitudPromedio, 0, SOUND_THRESHOLD) * 100LL) / SOUND_THRESHOLD);
-  display.setCursor(4, 26);
-  display.setTextSize(1);
-  display.printf("Nivel: %d%%", porcentaje);
-
-  display.setCursor(4, 36);
-  if (amplitudPromedio >= SOUND_THRESHOLD) {
-    display.println(">> AUDIO DETECTADO <<");
-  } else {
-    display.println("   Escuchando...");
-  }
-
   display.display();
-
   imprimirBarraTerminal(amplitudPromedio, SOUND_THRESHOLD);
 }
 
@@ -634,6 +639,7 @@ void loop() {
           httpListo = false;
           
           estadoActual = CAPTURA_VOZ;
+          inicioCapturaVoz = millis(); // Inicia el cronómetro de escucha
           actualizarPantalla();
           
           // Esperar a que se libere el botón (sin bloquear FreeRTOS)
@@ -648,29 +654,28 @@ void loop() {
     }
 
     case CAPTURA_VOZ: {
-      dibujarPantallaMicrofono();
-      
-      // Condición de finalización de grabación por umbral de sonido
-      if (amplitudPromedio >= SOUND_THRESHOLD) {
-        Serial.println("[FSM] Audio capturado con exito -> audioListo = true");
+      unsigned long transcurrido = millis() - inicioCapturaVoz;
+
+      if (transcurrido < TIEMPO_ESCUCHA_MS) {
+        // Sigue dentro de los 4 segundos de escucha
+        dibujarPantallaMicrofono(TIEMPO_ESCUCHA_MS - transcurrido);
+      } else {
+        // Se cumplió el tiempo: avanzar automáticamente a MUESTREO
+        Serial.println("[FSM] Tiempo de escucha finalizado -> MUESTREO");
         audioListo = true;
-        
         if (semFSM != NULL) {
           xSemaphoreGive(semFSM);
         }
 
-        // Breve aviso visual en OLED
-        display.setCursor(4, 36);
-        display.fillRect(4, 36, 120, 10, SSD1306_BLACK);
-        display.println(">> AUDIO LISTO! <<");
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(16, 28);
+        display.println("PREGUNTA CAPTURADA");
         display.display();
-        vTaskDelay(pdMS_TO_TICKS(600));
+        vTaskDelay(pdMS_TO_TICKS(500));
 
-        // Transición automática al siguiente estado
-        if (audioListo) {
-          estadoActual = MUESTREO;
-          actualizarPantalla();
-        }
+        estadoActual = MUESTREO;
+        actualizarPantalla();
       }
       vTaskDelay(pdMS_TO_TICKS(40));
       break;
