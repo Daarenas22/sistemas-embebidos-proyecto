@@ -1,10 +1,18 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <math.h>
 #include <arduinoFFT.h>
 #include <driver/i2s.h>
+
+// --- CONFIGURACIÓN WI-FI Y SERVIDOR FASTAPI ---
+const char* WIFI_SSID      = "PC";
+const char* WIFI_PASS      = "12345678";
+const char* SERVER_HOST    = "192.168.137.1";
+const uint16_t SERVER_PORT = 8000;
+const char* SERVER_PATH    = "/auditar";
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -27,7 +35,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define I2S_PORT I2S_NUM_0
 
 // Umbral de sonido calibrado para detección de audio
-#define SOUND_THRESHOLD 2200000
+#define SOUND_THRESHOLD 4200000
 #define TIEMPO_ESCUCHA_MS 4000 // 4 segundos para hacer la pregunta
 unsigned long inicioCapturaVoz = 0;
 
@@ -98,10 +106,23 @@ void iniciarMuestreoTimer() {
   portEXIT_CRITICAL(&timerMux);
 }
 
-// --- VARIABLES PARA VISUALIZACIÓN DEL MICRÓFONO ---
+// --- VARIABLES PARA VISUALIZACIÓN Y GRABACIÓN DEL MICRÓFONO ---
 #define MIC_SAMPLES 256
+#define AUDIO_SAMPLE_RATE 8000
+#define AUDIO_MAX_SECONDS 4
+#define AUDIO_MAX_SAMPLES (AUDIO_SAMPLE_RATE * AUDIO_MAX_SECONDS)
+
 int32_t micBuffer[MIC_SAMPLES];
-int32_t amplitudPromedio = 0;
+volatile int32_t amplitudPromedio = 0;
+int16_t* audioPCM = NULL;
+volatile size_t audioSampleIndex = 0;
+volatile bool grabandoAudio = false;
+TaskHandle_t taskAudioHandle = NULL;
+
+// Variables para respuesta del servidor
+bool ultimoHttpOk = false;
+int ultimoHttpCodigo = 0;
+String resumenOledServidor = "";
 
 #define BAR_HISTORY 32
 int barHistory[BAR_HISTORY];
@@ -161,8 +182,8 @@ void initI2SMic() {
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 128,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
     .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
@@ -183,7 +204,7 @@ void initI2SMic() {
 void enviarDisparoCamara() {
   Serial.printf("[WROOM] Activando pulso digital hacia ESP32-S3-CAM (GPIO %d)...\n", TRIGGER_CAM_PIN);
   digitalWrite(TRIGGER_CAM_PIN, HIGH);
-  vTaskDelay(pdMS_TO_TICKS(200));
+  vTaskDelay(pdMS_TO_TICKS(500));  // 500 ms: margen amplio para que la S3-CAM detecte el flanco
   digitalWrite(TRIGGER_CAM_PIN, LOW);
   Serial.println("[WROOM] Pulso finalizado.");
 }
@@ -311,35 +332,85 @@ void imprimirBarraTerminal(int32_t amp, int32_t maxRange) {
   }
 }
 
-// --- LECTURA DEL MICRÓFONO I2S PICO-A-PICO ---
-void leerMicrofono() {
-  size_t bytes_read = 0;
-  esp_err_t res = i2s_read(I2S_PORT, micBuffer, sizeof(micBuffer), &bytes_read, pdMS_TO_TICKS(50));
+// --- TAREA FREERTOS DE CAPTURA CONTINUA DE AUDIO I2S ---
+// Lee el flujo DMA continuamente durante CAPTURA_VOZ sin perder muestras mientras el OLED se actualiza
+void tareaAudioI2S(void *pvParameters) {
+  int32_t decimSum = 0;
+  int decimCount = 0;
+  int32_t dcFilter = 0;
+  int lastChOffset = 0;
+  bool estabaGrabando = false;
 
-  if (res == ESP_OK && bytes_read > 0) {
-    int samples_count = bytes_read / sizeof(int32_t);
-    int32_t max_ch0 = INT32_MIN, min_ch0 = INT32_MAX;
-    int32_t max_ch1 = INT32_MIN, min_ch1 = INT32_MAX;
-
-    for (int i = 0; i < samples_count; i += 2) {
-      int32_t val0 = micBuffer[i] >> 8;
-      int32_t val1 = micBuffer[i + 1] >> 8;
-
-      if (val0 > max_ch0) max_ch0 = val0;
-      if (val0 < min_ch0) min_ch0 = val0;
-
-      if (val1 > max_ch1) max_ch1 = val1;
-      if (val1 < min_ch1) min_ch1 = val1;
+  for (;;) {
+    if (!grabandoAudio) {
+      estabaGrabando = false;
+      vTaskDelay(pdMS_TO_TICKS(15));
+      continue;
     }
 
-    int32_t amp_ch0 = max_ch0 - min_ch0;
-    int32_t amp_ch1 = max_ch1 - min_ch1;
+    if (!estabaGrabando) {
+      estabaGrabando = true;
+      decimSum = 0;
+      decimCount = 0;
+      dcFilter = 0;
+    }
 
-    amplitudPromedio = (amp_ch0 > amp_ch1) ? amp_ch0 : amp_ch1;
+    size_t bytes_read = 0;
+    esp_err_t res = i2s_read(I2S_PORT, micBuffer, sizeof(micBuffer), &bytes_read, pdMS_TO_TICKS(50));
+
+    if (res == ESP_OK && bytes_read > 0) {
+      int samples_count = bytes_read / sizeof(int32_t);
+      int32_t max_ch0 = INT32_MIN, min_ch0 = INT32_MAX;
+      int32_t max_ch1 = INT32_MIN, min_ch1 = INT32_MAX;
+
+      for (int i = 0; i < samples_count; i += 2) {
+        int32_t val0 = micBuffer[i] >> 8;
+        int32_t val1 = micBuffer[i + 1] >> 8;
+
+        if (val0 > max_ch0) max_ch0 = val0;
+        if (val0 < min_ch0) min_ch0 = val0;
+
+        if (val1 > max_ch1) max_ch1 = val1;
+        if (val1 < min_ch1) min_ch1 = val1;
+      }
+
+      int32_t amp_ch0 = max_ch0 - min_ch0;
+      int32_t amp_ch1 = max_ch1 - min_ch1;
+
+      amplitudPromedio = (amp_ch0 > amp_ch1) ? amp_ch0 : amp_ch1;
+
+      if (amp_ch0 > 0 || amp_ch1 > 0) {
+        lastChOffset = (amp_ch1 > amp_ch0) ? 1 : 0;
+      }
+
+      // Decimar 4:1 (32000 Hz -> 8000 Hz) en PCM 16-bit mono
+      if (audioPCM != NULL) {
+        for (int i = 0; i < samples_count; i += 2) {
+          int32_t sample16 = micBuffer[i + lastChOffset] >> 15;
+          decimSum += sample16;
+          decimCount++;
+
+          if (decimCount == 4) {
+            int32_t avg = decimSum / 4;
+            decimSum = 0;
+            decimCount = 0;
+
+            dcFilter += (avg - dcFilter) >> 8;
+            int32_t clean = avg - dcFilter;
+
+            if (clean > 32767) clean = 32767;
+            else if (clean < -32768) clean = -32768;
+
+            if (audioSampleIndex < AUDIO_MAX_SAMPLES) {
+              audioPCM[audioSampleIndex++] = (int16_t)clean;
+            }
+          }
+        }
+      }
+    }
   }
 }
 
-// --- PANTALLA: CAPTURA DE VOZ ---
 // --- PANTALLA: CAPTURA DE VOZ CON TEMPORIZADOR ---
 void dibujarPantallaMicrofono(unsigned long tiempoRestanteMs) {
   display.clearDisplay();
@@ -355,25 +426,25 @@ void dibujarPantallaMicrofono(unsigned long tiempoRestanteMs) {
   display.printf("%.1fs", segRestantes);
   display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
 
-  leerMicrofono();
+  int32_t ampActual = amplitudPromedio;
 
   // Indicador de estado del micrófono (Detecta si hay señal activa)
   display.setCursor(4, 13);
-  if (amplitudPromedio > 150000) { // Umbral bajo solo para confirmar que entra voz
+  if (ampActual > 150000) { // Umbral bajo solo para confirmar que entra voz
     display.print("MIC: [REC] Captando");
   } else {
     display.print("MIC: [ON]  Habla...");
   }
 
   // Barra de nivel de volumen en tiempo real
-  int anchoBarraOLED = map(constrain(amplitudPromedio, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 120);
+  int anchoBarraOLED = map(constrain(ampActual, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 120);
   display.drawRect(4, 24, 120, 8, SSD1306_WHITE);
   if (anchoBarraOLED > 2) {
     display.fillRect(6, 26, anchoBarraOLED - 4, 4, SSD1306_WHITE);
   }
 
   // Historial gráfico inferior (espectrograma de barras)
-  int histH = map(constrain(amplitudPromedio, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 24);
+  int histH = map(constrain(ampActual, 0, SOUND_THRESHOLD), 0, SOUND_THRESHOLD, 0, 24);
   barHistory[barIndex] = histH;
   barIndex = (barIndex + 1) % BAR_HISTORY;
 
@@ -391,7 +462,7 @@ void dibujarPantallaMicrofono(unsigned long tiempoRestanteMs) {
   display.drawLine(0, baseY, SCREEN_WIDTH - 1, baseY, SSD1306_WHITE);
 
   display.display();
-  imprimirBarraTerminal(amplitudPromedio, SOUND_THRESHOLD);
+  imprimirBarraTerminal(ampActual, SOUND_THRESHOLD);
 }
 
 // --- PANTALLA: ONDA AC SIMULADA ---
@@ -497,9 +568,153 @@ void ejecutarMuestreo() {
   }
 }
 
-// --- ETAPA: ENVÍO HTTP (SIMULACIÓN DE TELEMETRÍA Y RESPUESTA) ---
+// --- UTILIDADES PARA WAV, BASE64 STREAMING Y CONEXIÓN WI-FI ---
+void construirCabeceraWAV(uint8_t* header, uint32_t dataBytes, uint32_t sampleRate) {
+  uint32_t fileSizeMinus8 = 36 + dataBytes;
+  uint32_t byteRate = sampleRate * 2;
+  uint16_t blockAlign = 2;
+  uint16_t bitsPerSample = 16;
+  uint16_t audioFormat = 1;
+  uint16_t numChannels = 1;
+  uint32_t subchunk1Size = 16;
+
+  memcpy(header + 0,  "RIFF", 4);
+  memcpy(header + 4,  &fileSizeMinus8, 4);
+  memcpy(header + 8,  "WAVE", 4);
+  memcpy(header + 12, "fmt ", 4);
+  memcpy(header + 16, &subchunk1Size, 4);
+  memcpy(header + 20, &audioFormat, 2);
+  memcpy(header + 22, &numChannels, 2);
+  memcpy(header + 24, &sampleRate, 4);
+  memcpy(header + 28, &byteRate, 4);
+  memcpy(header + 32, &blockAlign, 2);
+  memcpy(header + 34, &bitsPerSample, 2);
+  memcpy(header + 36, "data", 4);
+  memcpy(header + 40, &dataBytes, 4);
+}
+
+void enviarBase64Stream(WiFiClient& client, const uint8_t* wavHeader, size_t headerLen,
+                        const uint8_t* pcmBytes, size_t pcmLen) {
+  static const char B64_TABLE[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const size_t totalLen = headerLen + pcmLen;
+  char outBuf[1024];
+  size_t outIdx = 0;
+  size_t pos = 0;
+
+  while (pos < totalLen) {
+    size_t rem = totalLen - pos;
+    uint8_t b0 = (pos < headerLen) ? wavHeader[pos] : pcmBytes[pos - headerLen];
+    pos++;
+    uint8_t b1 = 0;
+    if (rem > 1) {
+      b1 = (pos < headerLen) ? wavHeader[pos] : pcmBytes[pos - headerLen];
+      pos++;
+    }
+    uint8_t b2 = 0;
+    if (rem > 2) {
+      b2 = (pos < headerLen) ? wavHeader[pos] : pcmBytes[pos - headerLen];
+      pos++;
+    }
+
+    uint32_t triple = ((uint32_t)b0 << 16) | ((uint32_t)b1 << 8) | (uint32_t)b2;
+
+    outBuf[outIdx++] = B64_TABLE[(triple >> 18) & 0x3F];
+    outBuf[outIdx++] = B64_TABLE[(triple >> 12) & 0x3F];
+    outBuf[outIdx++] = (rem > 1) ? B64_TABLE[(triple >> 6) & 0x3F] : '=';
+    outBuf[outIdx++] = (rem > 2) ? B64_TABLE[triple & 0x3F] : '=';
+
+    if (outIdx == sizeof(outBuf)) {
+      client.write((const uint8_t*)outBuf, outIdx);
+      outIdx = 0;
+      vTaskDelay(1);
+    }
+  }
+  if (outIdx > 0) {
+    client.write((const uint8_t*)outBuf, outIdx);
+  }
+}
+
+bool asegurarWiFiConectado(unsigned long timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  Serial.printf("[WIFI] Conectando a %s...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - inicio) < timeoutMs) {
+    vTaskDelay(pdMS_TO_TICKS(250));
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WIFI] Conectado. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.println("[WIFI] No se pudo conectar.");
+  return false;
+}
+
+// Extrae el valor string de un campo JSON específico mientras drena el flujo HTTP
+String extraerCampoJsonDeStream(WiFiClient& client, const char* claveObjetivo, unsigned long timeoutMs) {
+  String cuerpoParcial = "";
+  cuerpoParcial.reserve(2560);
+  unsigned long ultimoDato = millis();
+
+  while ((client.connected() || client.available()) && (millis() - ultimoDato) < timeoutMs) {
+    if (client.available()) {
+      char c = (char)client.read();
+      ultimoDato = millis();
+      if (cuerpoParcial.length() < 2500) {
+        cuerpoParcial += c;
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+
+  String patron = "\"";
+  patron += claveObjetivo;
+  patron += "\"";
+  int idx = cuerpoParcial.indexOf(patron);
+  if (idx < 0) return "";
+
+  int colon = cuerpoParcial.indexOf(':', idx + patron.length());
+  if (colon < 0) return "";
+
+  int startQuote = cuerpoParcial.indexOf('"', colon + 1);
+  if (startQuote < 0) return "";
+
+  String valor = "";
+  bool escaped = false;
+  for (int i = startQuote + 1; i < (int)cuerpoParcial.length(); i++) {
+    char c = cuerpoParcial[i];
+    if (escaped) {
+      if (c == 'n') valor += '\n';
+      else if (c == 'r') {}
+      else if (c == 't') valor += ' ';
+      else valor += c;
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      break;
+    } else {
+      valor += c;
+    }
+  }
+  return valor;
+}
+
+// --- ETAPA: ENVÍO HTTP REAL (AUDIO WAV + MÉTRICAS FFT A /auditar) ---
 void ejecutarEnvioHTTP() {
   Serial.println("[FSM] -> Entrando a estado ENVIO HTTP.");
+  ultimoHttpOk = false;
+  ultimoHttpCodigo = 0;
+  resumenOledServidor = "";
 
   display.clearDisplay();
   display.setTextSize(1);
@@ -508,21 +723,110 @@ void ejecutarEnvioHTTP() {
   display.println("ESTADO: ENVIO HTTP");
   display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
 
-  display.setCursor(4, 16);
-  display.println("Conectando al servidor...");
-  display.setCursor(4, 28);
-  display.println("POST /api/telemetria");
-  display.setCursor(4, 40);
-  display.println("Enviando audio y FFT...");
+  display.setCursor(4, 15);
+  display.println("Conectando Wi-Fi...");
   display.display();
 
-  // Simulación de latencia de red mediante vTaskDelay
-  vTaskDelay(pdMS_TO_TICKS(1500));
+  if (!asegurarWiFiConectado(10000)) {
+    display.setCursor(4, 30);
+    display.println("ERROR: Sin Wi-Fi");
+    display.display();
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    httpListo = true;
+    if (semFSM != NULL) xSemaphoreGive(semFSM);
+    return;
+  }
+
+  size_t muestrasValidas = (audioPCM != NULL) ? audioSampleIndex : 0;
+  uint32_t dataBytes = (uint32_t)(muestrasValidas * sizeof(int16_t));
+  uint8_t wavHeader[44];
+  bool tieneAudio = (muestrasValidas > 0 && audioPCM != NULL);
+
+  if (tieneAudio) {
+    construirCabeceraWAV(wavHeader, dataBytes, AUDIO_SAMPLE_RATE);
+  }
+
+  char jsonPrefix[256];
+  snprintf(jsonPrefix, sizeof(jsonPrefix),
+           "{\"fundamental\":%.2f,\"h3\":%.2f,\"h5\":%.2f,\"h7\":%.2f,\"thd\":%.2f,\"audio_base64\":\"",
+           frecuenciaDominante, magArmonico3, magArmonico5, magArmonico7, porcentajeTHD);
+  const char* jsonSuffix = "\"}";
+
+  size_t rawAudioTotal = tieneAudio ? (sizeof(wavHeader) + dataBytes) : 0;
+  size_t b64Len = tieneAudio ? (((rawAudioTotal + 2) / 3) * 4) : 0;
+  size_t contentLength = strlen(jsonPrefix) + b64Len + strlen(jsonSuffix);
+
+  display.setCursor(4, 27);
+  display.printf("POST %s", SERVER_PATH);
+  display.setCursor(4, 39);
+  display.printf("Audio: %u B + FFT", (unsigned int)rawAudioTotal);
+  display.display();
+
+  Serial.printf("[HTTP] Conectando a %s:%u%s (Content-Length: %u bytes, muestras: %u)...\n",
+                SERVER_HOST, SERVER_PORT, SERVER_PATH,
+                (unsigned int)contentLength, (unsigned int)muestrasValidas);
+
+  WiFiClient client;
+  if (client.connect(SERVER_HOST, SERVER_PORT)) {
+    client.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
+    client.printf("Host: %s:%u\r\n", SERVER_HOST, SERVER_PORT);
+    client.print("Content-Type: application/json\r\n");
+    client.printf("Content-Length: %u\r\n", (unsigned int)contentLength);
+    client.print("Connection: close\r\n\r\n");
+
+    client.print(jsonPrefix);
+    if (tieneAudio) {
+      enviarBase64Stream(client, wavHeader, sizeof(wavHeader),
+                         (const uint8_t*)audioPCM, dataBytes);
+    }
+    client.print(jsonSuffix);
+
+    // Esperar respuesta del servidor (STT + Gemini + gTTS puede tomar varios segundos)
+    unsigned long waitStart = millis();
+    while (client.connected() && !client.available() && (millis() - waitStart < 25000)) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (client.available()) {
+      String statusLine = client.readStringUntil('\n');
+      statusLine.trim();
+      Serial.printf("[HTTP] Respuesta: %s\n", statusLine.c_str());
+
+      int sp1 = statusLine.indexOf(' ');
+      if (sp1 > 0) {
+        ultimoHttpCodigo = statusLine.substring(sp1 + 1).toInt();
+      }
+      ultimoHttpOk = (ultimoHttpCodigo >= 200 && ultimoHttpCodigo < 300);
+
+      // Saltar encabezados HTTP hasta línea vacía
+      while (client.connected() || client.available()) {
+        String hLine = client.readStringUntil('\n');
+        if (hLine == "\r" || hLine.length() == 0) break;
+      }
+
+      resumenOledServidor = extraerCampoJsonDeStream(client, "resumen_oled", 5000);
+      if (resumenOledServidor.length() > 0) {
+        Serial.println("[HTTP] Resumen OLED recibido:");
+        Serial.println(resumenOledServidor);
+      }
+    } else {
+      Serial.println("[HTTP] Timeout esperando respuesta del servidor.");
+    }
+    client.stop();
+  } else {
+    Serial.printf("[HTTP] ERROR: No se pudo conectar a %s:%u\n", SERVER_HOST, SERVER_PORT);
+  }
 
   display.setCursor(4, 52);
-  display.println("Respuesta: 200 OK!");
+  if (ultimoHttpOk) {
+    display.printf("Respuesta: %d OK!", ultimoHttpCodigo);
+  } else if (ultimoHttpCodigo > 0) {
+    display.printf("Error HTTP: %d", ultimoHttpCodigo);
+  } else {
+    display.println("Error de conexion");
+  }
   display.display();
-  vTaskDelay(pdMS_TO_TICKS(600));
+  vTaskDelay(pdMS_TO_TICKS(800));
 
   // Sincronización: señalar que la comunicación HTTP terminó
   httpListo = true;
@@ -542,18 +846,33 @@ void mostrarResultadoYFinalizar() {
   display.println("ESTADO: DICTAMEN");
   display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
 
-  display.setCursor(4, 14);
-  display.printf("Freq. Pico: %.1f Hz\n", frecuenciaDominante);
-
-  display.setCursor(4, 25);
-  display.printf("THD: %.1f %% | OK (200)\n", porcentajeTHD);
-
-  display.setCursor(4, 37);
-  display.setTextSize(2);
-  if (esIncandescente || frecuenciaDominante == 0.0) {
-    display.println("INCANDESC.");
+  if (ultimoHttpOk && resumenOledServidor.length() > 0) {
+    int y = 14;
+    int start = 0;
+    while (start < (int)resumenOledServidor.length() && y <= 44) {
+      int nl = resumenOledServidor.indexOf('\n', start);
+      String linea = (nl >= 0) ? resumenOledServidor.substring(start, nl) : resumenOledServidor.substring(start);
+      if (linea.length() > 21) linea = linea.substring(0, 21);
+      display.setCursor(2, y);
+      display.println(linea);
+      y += 11;
+      if (nl < 0) break;
+      start = nl + 1;
+    }
   } else {
-    display.println("OTRA CARGA");
+    display.setCursor(4, 14);
+    display.printf("Freq. Pico: %.1f Hz\n", frecuenciaDominante);
+
+    display.setCursor(4, 25);
+    display.printf("THD: %.1f %% | %s\n", porcentajeTHD, ultimoHttpOk ? "OK (200)" : "LOCAL");
+
+    display.setCursor(4, 37);
+    display.setTextSize(2);
+    if (esIncandescente || frecuenciaDominante == 0.0) {
+      display.println("INCANDESC.");
+    } else {
+      display.println("OTRA CARGA");
+    }
   }
 
   display.setTextSize(1);
@@ -610,9 +929,32 @@ void setup() {
     1                   // Fijada a Core 1
   );
 
-  // Inicializar micrófono I2S
+  // Reservar buffer de audio PCM (4s @ 8000Hz 16-bit = 64KB) antes de iniciar Wi-Fi
+  audioPCM = (int16_t*)malloc(AUDIO_MAX_SAMPLES * sizeof(int16_t));
+  if (audioPCM == NULL) {
+    Serial.println("[WARN] No se pudo reservar buffer de audio en heap.");
+  } else {
+    Serial.printf("[SETUP] Buffer de audio reservado (%u bytes). Heap libre: %u\n",
+                  (unsigned int)(AUDIO_MAX_SAMPLES * sizeof(int16_t)), ESP.getFreeHeap());
+  }
+
+  // Inicializar micrófono I2S y tarea de captura continua
   initI2SMic();
+  xTaskCreatePinnedToCore(
+    tareaAudioI2S,
+    "TareaAudioI2S",
+    4096,
+    NULL,
+    2,
+    &taskAudioHandle,
+    0
+  );
   Serial.println("[SETUP] Microfono I2S INMP441 y Modulo DSP inicializados.");
+
+  // Iniciar conexión Wi-Fi en segundo plano
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[SETUP] Conectando Wi-Fi (%s)...\n", WIFI_SSID);
 
   memset(barHistory, 0, sizeof(barHistory));
   
@@ -637,7 +979,12 @@ void loop() {
           audioListo = false;
           muestreoListo = false;
           httpListo = false;
-          
+
+          i2s_zero_dma_buffer(I2S_PORT);
+          audioSampleIndex = 0;
+          amplitudPromedio = 0;
+          grabandoAudio = true;
+
           estadoActual = CAPTURA_VOZ;
           inicioCapturaVoz = millis(); // Inicia el cronómetro de escucha
           actualizarPantalla();
@@ -660,8 +1007,11 @@ void loop() {
         // Sigue dentro de los 4 segundos de escucha
         dibujarPantallaMicrofono(TIEMPO_ESCUCHA_MS - transcurrido);
       } else {
-        // Se cumplió el tiempo: avanzar automáticamente a MUESTREO
-        Serial.println("[FSM] Tiempo de escucha finalizado -> MUESTREO");
+        // Se cumplió el tiempo: detener captura de audio y avanzar a MUESTREO
+        grabandoAudio = false;
+        vTaskDelay(pdMS_TO_TICKS(60));
+        Serial.printf("[FSM] Tiempo de escucha finalizado (%u muestras capturadas) -> MUESTREO\n",
+                      (unsigned int)audioSampleIndex);
         audioListo = true;
         if (semFSM != NULL) {
           xSemaphoreGive(semFSM);

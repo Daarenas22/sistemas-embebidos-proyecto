@@ -354,6 +354,9 @@
         <div class="text-block placeholder" id="transcripcion">
             Esperando consulta por voz desde el ESP32-WROOM…
         </div>
+        <div class="audio-container" id="micAudioContainer" style="display: none;">
+            <audio id="micAudioPlayer" controls></audio>
+        </div>
     </div>
 
     <!-- PANTALLA OLED PREVIEW -->
@@ -397,6 +400,8 @@
     const yoloDetalle     = $('yoloDetalle');
     const fftContent      = $('fftContent');
     const transcripcionEl = $('transcripcion');
+    const micAudioContainer = $('micAudioContainer');
+    const micAudioPlayer    = $('micAudioPlayer');
     const veredictoEl     = $('veredicto');
     const resumenOledEl   = $('resumenOled');
     const audioContainer  = $('audioContainer');
@@ -405,12 +410,29 @@
     let ws;
     let reconnectTimer;
 
+    function renderLiveFrame(msg) {
+        let img = fotoContainer.querySelector('img');
+        if (!img) {
+            fotoContainer.innerHTML = `<img id="liveFotoImg" alt="Video en vivo">`;
+            img = fotoContainer.querySelector('img');
+        }
+        img.src = `data:image/jpeg;base64,${msg.img_b64}`;
+        img.dataset.ts = msg.ts || '';
+        yoloBadge.textContent = `EN VIVO ${msg.frame}/${msg.total}`;
+        yoloDetalle.textContent = 'Transmitiendo ráfaga en tiempo real…';
+        fotoTs.textContent = `Frame ${msg.frame} de ${msg.total}`;
+    }
+
     function renderFoto(state) {
         if (state.ultima_foto) {
-            const currentImg = fotoContainer.querySelector('img');
-            if (!currentImg || currentImg.dataset.ts !== state.ultima_foto_ts) {
+            let currentImg = fotoContainer.querySelector('img');
+            if (!currentImg) {
                 fotoContainer.innerHTML =
-                    `<img src="${state.ultima_foto}" alt="Foto procesada" class="fade-in" data-ts="${state.ultima_foto_ts}">`;
+                    `<img id="liveFotoImg" src="${state.ultima_foto}" alt="Foto procesada" class="fade-in" data-ts="${state.ultima_foto_ts}">`;
+                fotoTs.textContent = `Captura: ${state.ultima_foto_ts || ''}`;
+            } else if (currentImg.dataset.ts !== state.ultima_foto_ts || currentImg.src.startsWith('data:')) {
+                currentImg.src = state.ultima_foto;
+                currentImg.dataset.ts = state.ultima_foto_ts;
                 fotoTs.textContent = `Captura: ${state.ultima_foto_ts || ''}`;
             }
         }
@@ -467,6 +489,13 @@
     }
 
     function renderAudio(state) {
+        if (state.audio_consulta_base64) {
+            const micSrc = `data:audio/wav;base64,${state.audio_consulta_base64}`;
+            if (micAudioPlayer.src !== micSrc) {
+                micAudioPlayer.src = micSrc;
+                micAudioContainer.style.display = 'flex';
+            }
+        }
         if (state.audio_tts_base64) {
             const audioSrc = `data:audio/mp3;base64,${state.audio_tts_base64}`;
             if (audioPlayer.src !== audioSrc) {
@@ -503,8 +532,12 @@
 
         ws.onmessage = (e) => {
             try {
-                const state = JSON.parse(e.data);
-                render(state);
+                const msg = JSON.parse(e.data);
+                if (msg.tipo === 'frame') {
+                    renderLiveFrame(msg);
+                } else {
+                    render(msg);
+                }
             } catch(err) {
                 console.error('Error parsing WS message:', err);
             }

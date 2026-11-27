@@ -67,6 +67,7 @@ state = {
     "yolo_detalle": None,         # Detalle de confianza y detecciones
     "fft": None,                  # {fundamental, h3, h5, h7, thd}
     "transcripcion": None,        # Texto de la consulta de voz
+    "audio_consulta_base64": None,# Audio WAV captado por el micrófono del ESP32-WROOM
     "veredicto": None,            # Análisis completo de Gemini
     "resumen_oled": None,         # Texto corto (2-3 líneas) para pantalla OLED
     "audio_tts_base64": None,     # Audio de respuesta en Base64 (gTTS)
@@ -107,6 +108,7 @@ def _snapshot() -> dict:
         "yolo_detalle": state["yolo_detalle"],
         "fft": state["fft"],
         "transcripcion": state["transcripcion"],
+        "audio_consulta_base64": state["audio_consulta_base64"],
         "veredicto": state["veredicto"],
         "resumen_oled": state["resumen_oled"],
         "audio_tts_base64": state["audio_tts_base64"],
@@ -440,6 +442,58 @@ async def get_estado():
     return JSONResponse(_snapshot())
 
 
+@app.post("/foto-stream")
+async def recibir_foto_stream(
+    file: UploadFile = File(...),
+    frame: int = 1,
+    total: int = 1,
+    final: int = 0
+):
+    """
+    Recibe una ráfaga continua de cuadros JPEG del ESP32-S3-CAM y los emite
+    de inmediato vía WebSocket para simular video en tiempo real.
+    En el cuadro final (final=1), ejecuta YOLOv8 y guarda la imagen anotada.
+    """
+    contenido = await file.read()
+    ts_ms = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    img_b64 = base64.b64encode(contenido).decode("utf-8")
+
+    # Emitir cuadro inmediato sin audio Base64 para máxima fluidez en tiempo real
+    await manager.broadcast({
+        "tipo": "frame",
+        "frame": frame,
+        "total": total,
+        "ts": ts_ms,
+        "img_b64": img_b64,
+    })
+
+    if final == 1:
+        nombre_orig = f"orig_{ts_ms}.jpg"
+        nombre_anotada = f"yolo_{ts_ms}.jpg"
+
+        ruta_orig = FOTOS_DIR / nombre_orig
+        ruta_anotada = FOTOS_DIR / nombre_anotada
+        ruta_orig.write_bytes(contenido)
+
+        etiqueta, detalle = procesar_imagen_yolo(ruta_orig, ruta_anotada)
+
+        state["ultima_foto_path"] = str(ruta_anotada)
+        state["ultima_foto_ts"] = ts_ms
+        state["etiqueta_visual"] = etiqueta
+        state["yolo_detalle"] = detalle
+
+        await manager.broadcast(_snapshot())
+
+        return {
+            "ok": True,
+            "final": True,
+            "etiqueta_visual": etiqueta,
+            "detalle": detalle,
+        }
+
+    return {"ok": True, "frame": frame}
+
+
 @app.post("/foto")
 async def recibir_foto(file: UploadFile = File(...)):
     """
@@ -449,7 +503,7 @@ async def recibir_foto(file: UploadFile = File(...)):
     3. Dibuja las bounding boxes y guarda la imagen anotada.
     4. Actualiza el dashboard web vía WebSocket.
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     nombre_orig = f"orig_{ts}.jpg"
     nombre_anotada = f"yolo_{ts}.jpg"
 
@@ -505,6 +559,7 @@ async def auditar(datos: DatosFFT):
 
     # 2. Transcripción del audio de la consulta
     transcripcion = ""
+    state["audio_consulta_base64"] = datos.audio_base64 if datos.audio_base64 else None
     if datos.audio_base64:
         transcripcion = transcribir_audio_google(datos.audio_base64)
     if not transcripcion and datos.pregunta:
