@@ -8,11 +8,14 @@
 #include <driver/i2s.h>
 
 // --- CONFIGURACIÓN WI-FI Y SERVIDOR FASTAPI ---
-const char* WIFI_SSID      = "PC";
-const char* WIFI_PASS      = "12345678";
-const char* SERVER_HOST    = "192.168.137.1";
-const uint16_t SERVER_PORT = 8000;
-const char* SERVER_PATH    = "/auditar";
+const char* WIFI_SSID            = "PC";
+const char* WIFI_PASS            = "12345678";
+const char* SERVER_HOST          = "192.168.137.1";
+const uint16_t SERVER_PORT       = 8000;
+const char* SERVER_PATH          = "/auditar?solo_resumen=1";
+const char* SERVER_SALUDO_WAV    = "/saludo-wav";     // Audio WAV PCM 16kHz del saludo IA
+const char* SERVER_VEREDICTO_WAV = "/veredicto-wav";  // Audio WAV PCM 16kHz del resumen del veredicto
+const char* SERVER_CAM_TRIGGER   = "/disparar-camara"; // Disparo coordinado por Wi-Fi para S3-CAM
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -28,11 +31,22 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define OLED_SDA 25        // Pin marcado D25 en la placa
 #define OLED_SCL 26        // Pin marcado D26 en la placa
 
-// --- PINES I2S PARA MICRÓFONO INMP441 (LADO DERECHO) ---
+// --- PINES I2S PARA MICRÓFONO INMP441 (I2S_NUM_0 — LADO DERECHO) ---
 #define I2S_WS   15   // Word Select (LRCK) - Pin marcado D15
 #define I2S_SCK   4   // Serial Clock (BCLK) - Pin marcado D4
 #define I2S_SD   19   // Serial Data (DOUT del mic) - Pin marcado D19
 #define I2S_PORT I2S_NUM_0
+
+// --- PINES I2S PARA AMPLIFICADOR MAX98357A (I2S_NUM_1 — SPEAKER) ---
+// Pines del módulo MAX98357A (de izq. a der. en la placa morada):
+//   LRC  -> GPIO 14 (D14) | BCLK -> GPIO 27 (D27) | DIN -> GPIO 13 (D13)
+//   GAIN -> Sin conectar (9 dB) | SD -> Sin conectar (mezcla L+R activa)
+//   GND  -> GND | Vin -> 3.3V o VIN (5V) | Terminal +/- -> Bocina 4-8 Ohm
+#define SPK_BCLK       27        // BCLK del MAX98357A - Pin marcado D27 (Lado Izquierdo)
+#define SPK_LRC        14        // LRC (Word Select) del MAX98357A - Pin marcado D14 (Lado Derecho)
+#define SPK_DIN        13        // DIN (Data In) del MAX98357A - Pin marcado D13 (Lado Derecho)
+#define SPK_PORT       I2S_NUM_1
+#define SPK_SAMPLE_RATE 16000    // 16 kHz para voz clara y natural
 
 // Umbral de sonido calibrado para detección de audio
 #define SOUND_THRESHOLD 4200000
@@ -124,6 +138,14 @@ bool ultimoHttpOk = false;
 int ultimoHttpCodigo = 0;
 String resumenOledServidor = "";
 
+// ====================================================================
+// --- MÓDULO DE AUDIO: MAX98357A I2S SPEAKER (STREAMING HTTP WAV) ---
+// ====================================================================
+volatile bool reproduciendo = false;
+bool saludoReproducido = false;        // Para que el saludo suene al entrar en STANDBY
+unsigned long ultimoIntentoSaludoMs = 0;
+uint8_t intentosSaludo = 0;
+
 #define BAR_HISTORY 32
 int barHistory[BAR_HISTORY];
 int barIndex = 0;
@@ -170,10 +192,13 @@ const unsigned char epd_bitmap_spidy [] PROGMEM = {
   0x30, 0x07, 0x0a, 0x00, 0x30, 0xe0, 0x03, 0x04, 0x00, 0x30, 0xc0, 0x03, 0x87, 0x42, 0xe0, 0xc0, 
   0x01, 0xc8, 0x7e, 0x13, 0x80, 0x00, 0xf0, 0x42, 0x0f, 0x00, 0x00, 0x38, 0x42, 0x1e, 0x00, 0x00, 
   0x1e, 0x00, 0x78, 0x00, 0x00, 0x07, 0xff, 0xe0, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+  0x00, 0x00, 0x00, 0x00
 };
 
-// --- INICIALIZACIÓN DE HARDWARE I2S ---
+// ====================================================================
+// --- INICIALIZACIÓN DE HARDWARE I2S (MICRÓFONO + SPEAKER) ---
+// ====================================================================
+
 void initI2SMic() {
   const i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -200,12 +225,403 @@ void initI2SMic() {
   i2s_set_pin(I2S_PORT, &pin_config);
 }
 
-// --- DISPARO DIGITAL A LA CÁMARA (ESP32-S3-CAM) ---
+void initI2SSpeaker() {
+  const i2s_config_t spk_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SPK_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 6,
+    .dma_buf_len = 256,   // 6*256 = 1536 frames (~96 ms a 16 kHz) para drenado limpio
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+
+  const i2s_pin_config_t spk_pins = {
+    .bck_io_num = SPK_BCLK,
+    .ws_io_num = SPK_LRC,
+    .data_out_num = SPK_DIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+
+  i2s_driver_install(SPK_PORT, &spk_config, 0, NULL);
+  i2s_set_pin(SPK_PORT, &spk_pins);
+  i2s_zero_dma_buffer(SPK_PORT);
+  Serial.println("[SETUP] Amplificador MAX98357A (I2S_NUM_1 @ 16kHz) inicializado.");
+}
+
+// ====================================================================
+// --- REPRODUCCIÓN DE AUDIO WAV EN STREAMING POR I2S (MAX98357A) ---
+// ====================================================================
+
+// Prototipo de utilidad Wi-Fi definida más abajo
+bool asegurarWiFiConectado(unsigned long timeoutMs);
+
+static const uint8_t b64_lookup[128] = {
+  64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+  64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+  64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+  52,53,54,55,56,57,58,59,60,61,64,64,64, 0,64,64,
+  64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+  15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+  64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+  41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64
+};
+
+// Descarga un archivo WAV PCM 16-bit directamente desde el servidor y lo reproduce
+// en streaming por el MAX98357A sin límite de duración ni uso de heap extra.
+// No modifica la pantalla OLED para mantener visible el saludo o el veredicto.
+bool reproducirWavDesdeEndpoint(const char* path) {
+  Serial.printf("[SPEAKER] Solicitando streaming WAV desde %s...\n", path);
+
+  if (!asegurarWiFiConectado(8000)) {
+    Serial.println("[SPEAKER] Sin Wi-Fi para reproducir audio.");
+    return false;
+  }
+
+  WiFiClient client;
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+    Serial.printf("[SPEAKER] No se pudo conectar a %s:%u\n", SERVER_HOST, SERVER_PORT);
+    return false;
+  }
+
+  client.printf("GET %s HTTP/1.1\r\n", path);
+  client.printf("Host: %s:%u\r\n", SERVER_HOST, SERVER_PORT);
+  client.print("Connection: close\r\n\r\n");
+
+  unsigned long waitStart = millis();
+  while (client.connected() && !client.available() && (millis() - waitStart < 15000)) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  if (!client.available()) {
+    Serial.println("[SPEAKER] Timeout esperando respuesta del servidor.");
+    client.stop();
+    return false;
+  }
+
+  // Leer línea de estado HTTP
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  int sp1 = statusLine.indexOf(' ');
+  int httpCode = (sp1 > 0) ? statusLine.substring(sp1 + 1).toInt() : 0;
+  if (httpCode < 200 || httpCode >= 300) {
+    Serial.printf("[SPEAKER] Error HTTP %d en %s\n", httpCode, path);
+    client.stop();
+    return false;
+  }
+
+  // Leer headers HTTP hasta línea vacía y capturar Content-Length
+  long contentLength = -1;
+  while (client.connected() || client.available()) {
+    String hLine = client.readStringUntil('\n');
+    if (hLine == "\r" || hLine.length() == 0) break;
+    String lower = hLine;
+    lower.toLowerCase();
+    if (lower.startsWith("content-length:")) {
+      contentLength = lower.substring(15).toInt();
+    }
+  }
+
+  // Leer los 44 bytes de cabecera WAV
+  uint8_t wavHdr[44];
+  size_t hdrRead = 0;
+  unsigned long lastRx = millis();
+  while (hdrRead < 44 && (client.connected() || client.available()) && (millis() - lastRx < 5000)) {
+    if (client.available()) {
+      int n = client.read(wavHdr + hdrRead, 44 - hdrRead);
+      if (n > 0) {
+        hdrRead += n;
+        lastRx = millis();
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+
+  if (hdrRead < 44 || memcmp(wavHdr, "RIFF", 4) != 0 || memcmp(wavHdr + 8, "WAVE", 4) != 0) {
+    Serial.println("[SPEAKER] Cabecera WAV inválida.");
+    client.stop();
+    return false;
+  }
+
+  uint16_t numChannels = (uint16_t)wavHdr[22] | ((uint16_t)wavHdr[23] << 8);
+  uint32_t sampleRate  = (uint32_t)wavHdr[24] | ((uint32_t)wavHdr[25] << 8) |
+                         ((uint32_t)wavHdr[26] << 16) | ((uint32_t)wavHdr[27] << 24);
+  if (sampleRate < 8000 || sampleRate > 48000) {
+    sampleRate = SPK_SAMPLE_RATE;
+  }
+  i2s_set_clk(SPK_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+  i2s_zero_dma_buffer(SPK_PORT);
+
+  Serial.printf("[SPEAKER] Streaming WAV: %u Hz, %u ch, Content-Length=%ld\n",
+                (unsigned int)sampleRate, (unsigned int)numChannels, contentLength);
+
+  reproduciendo = true;
+  uint8_t netBuf[512];
+  int16_t stereoChunk[512]; // hasta 256 frames estéreo (1024 bytes)
+  uint8_t carryByte = 0;
+  bool hasCarry = false;
+  size_t totalPcmBytes = 0;
+  long remainingBytes = (contentLength > 44) ? (contentLength - 44) : -1;
+  lastRx = millis();
+
+  while ((remainingBytes != 0) && (client.connected() || client.available()) && (millis() - lastRx < 5000)) {
+    if (!client.available()) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+
+    size_t toRead = sizeof(netBuf) - (hasCarry ? 1 : 0);
+    if (remainingBytes > 0 && (long)toRead > remainingBytes) {
+      toRead = (size_t)remainingBytes;
+    }
+
+    size_t startIdx = hasCarry ? 1 : 0;
+    if (hasCarry) {
+      netBuf[0] = carryByte;
+      hasCarry = false;
+    }
+
+    int n = client.read(netBuf + startIdx, toRead);
+    if (n <= 0) continue;
+
+    lastRx = millis();
+    if (remainingBytes > 0) remainingBytes -= n;
+
+    size_t bufBytes = startIdx + (size_t)n;
+    totalPcmBytes += (size_t)n;
+
+    if (numChannels == 1) {
+      // Asegurar múltiplo de 2 bytes (16-bit mono)
+      if (bufBytes & 1) {
+        carryByte = netBuf[bufBytes - 1];
+        hasCarry = true;
+        bufBytes--;
+      }
+      size_t monoSamples = bufBytes / 2;
+      const int16_t* mono = (const int16_t*)netBuf;
+      for (size_t s = 0; s < monoSamples; s++) {
+        stereoChunk[s * 2]     = mono[s];
+        stereoChunk[s * 2 + 1] = mono[s];
+      }
+      size_t bw = 0;
+      if (monoSamples > 0) {
+        i2s_write(SPK_PORT, stereoChunk, monoSamples * 4, &bw, portMAX_DELAY);
+      }
+    } else {
+      // Estéreo 16-bit: asegurar múltiplo de 4 bytes
+      size_t rem4 = bufBytes & 3;
+      if (rem4 == 1) {
+        carryByte = netBuf[bufBytes - 1];
+        hasCarry = true;
+        bufBytes--;
+      } else {
+        bufBytes -= rem4;
+      }
+      size_t bw = 0;
+      if (bufBytes > 0) {
+        i2s_write(SPK_PORT, netBuf, bufBytes, &bw, portMAX_DELAY);
+      }
+    }
+  }
+
+  client.stop();
+
+  // Enviar silencio equivalente al tamaño del DMA (6 * 256 frames) y esperar a que termine de sonar
+  memset(stereoChunk, 0, sizeof(stereoChunk));
+  size_t bw = 0;
+  for (int k = 0; k < 6; k++) {
+    i2s_write(SPK_PORT, stereoChunk, sizeof(stereoChunk), &bw, portMAX_DELAY);
+  }
+  vTaskDelay(pdMS_TO_TICKS(150));
+  i2s_zero_dma_buffer(SPK_PORT);
+
+  reproduciendo = false;
+  Serial.printf("[SPEAKER] Reproducción finalizada (%u bytes PCM).\n", (unsigned int)totalPcmBytes);
+  return (totalPcmBytes > 0);
+}
+
+// Lee el flujo JSON HTTP sin almacenar el audio Base64 en RAM (stream-decode directo a wavOut)
+void extraerResumenYAudioDeStream(WiFiClient& client, String* resumenOut,
+                                  uint8_t* wavOut, size_t maxWavBytes, size_t* wavLenOut,
+                                  unsigned long timeoutMs) {
+  if (resumenOut != NULL) *resumenOut = "";
+  if (wavLenOut != NULL) *wavLenOut = 0;
+
+  enum ParseState {
+    SCAN_KEY,
+    IN_KEY,
+    WAIT_COLON,
+    WAIT_VAL_START,
+    IN_SKIP_STR,
+    IN_RESUMEN_STR,
+    IN_AUDIO_B64
+  };
+
+  ParseState st = SCAN_KEY;
+  String keyBuf = "";
+  bool escaped = false;
+  char b64Quartet[4];
+  int b64Idx = 0;
+  size_t wavPos = 0;
+  unsigned long ultimoDato = millis();
+
+  while ((client.connected() || client.available()) && (millis() - ultimoDato) < timeoutMs) {
+    if (!client.available()) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
+    char c = (char)client.read();
+    ultimoDato = millis();
+
+    switch (st) {
+      case SCAN_KEY:
+        if (c == '"') {
+          keyBuf = "";
+          st = IN_KEY;
+        }
+        break;
+
+      case IN_KEY:
+        if (c == '"') {
+          st = WAIT_COLON;
+        } else if (keyBuf.length() < 32) {
+          keyBuf += c;
+        }
+        break;
+
+      case WAIT_COLON:
+        if (c == ':') {
+          st = WAIT_VAL_START;
+        } else if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+          st = SCAN_KEY;
+        }
+        break;
+
+      case WAIT_VAL_START:
+        if (c == '"') {
+          escaped = false;
+          if (resumenOut != NULL && keyBuf == "resumen_oled") {
+            st = IN_RESUMEN_STR;
+          } else if (wavOut != NULL && keyBuf == "audio_base64") {
+            b64Idx = 0;
+            wavPos = 0;
+            st = IN_AUDIO_B64;
+          } else {
+            st = IN_SKIP_STR;
+          }
+        } else if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+          // Valor numérico, booleano, null, objeto o array: volver a buscar claves
+          st = SCAN_KEY;
+        }
+        break;
+
+      case IN_SKIP_STR:
+        if (escaped) {
+          escaped = false;
+        } else if (c == '\\') {
+          escaped = true;
+        } else if (c == '"') {
+          st = SCAN_KEY;
+        }
+        break;
+
+      case IN_RESUMEN_STR:
+        if (escaped) {
+          if (c == 'n') *resumenOut += '\n';
+          else if (c == 'r') {}
+          else if (c == 't') *resumenOut += ' ';
+          else *resumenOut += c;
+          escaped = false;
+        } else if (c == '\\') {
+          escaped = true;
+        } else if (c == '"') {
+          st = SCAN_KEY;
+        } else if (resumenOut->length() < 200) {
+          *resumenOut += c;
+        }
+        break;
+
+      case IN_AUDIO_B64:
+        if (c == '"') {
+          st = SCAN_KEY;
+        } else if ((uint8_t)c < 128 && (b64_lookup[(uint8_t)c] < 64 || c == '=')) {
+          b64Quartet[b64Idx++] = c;
+          if (b64Idx == 4) {
+            b64Idx = 0;
+            uint8_t pad = (b64Quartet[2] == '=' ? 1 : 0) + (b64Quartet[3] == '=' ? 1 : 0);
+            uint32_t s0 = (b64Quartet[0] != '=') ? b64_lookup[(uint8_t)b64Quartet[0]] : 0;
+            uint32_t s1 = (b64Quartet[1] != '=') ? b64_lookup[(uint8_t)b64Quartet[1]] : 0;
+            uint32_t s2 = (b64Quartet[2] != '=') ? b64_lookup[(uint8_t)b64Quartet[2]] : 0;
+            uint32_t s3 = (b64Quartet[3] != '=') ? b64_lookup[(uint8_t)b64Quartet[3]] : 0;
+            uint32_t triple = (s0 << 18) | (s1 << 12) | (s2 << 6) | s3;
+
+            if (wavPos < maxWavBytes) wavOut[wavPos++] = (triple >> 16) & 0xFF;
+            if (pad < 2 && wavPos < maxWavBytes) wavOut[wavPos++] = (triple >> 8) & 0xFF;
+            if (pad < 1 && wavPos < maxWavBytes) wavOut[wavPos++] = triple & 0xFF;
+          }
+        }
+        break;
+    }
+  }
+
+  if (wavLenOut != NULL) *wavLenOut = wavPos;
+}
+
+bool asegurarWiFiConectado(unsigned long timeoutMs);
+
+bool solicitarSaludoServidor() {
+  return reproducirWavDesdeEndpoint(SERVER_SALUDO_WAV);
+}
+
+// --- DISPARO DIGITAL Y REMOTO A LA CÁMARA (ESP32-S3-CAM) ---
+volatile bool camaraDisparadaEnCiclo = false;
+
+void notificarDisparoCamaraServidor() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WROOM] Sin Wi-Fi para disparo remoto de cámara (solo GPIO).");
+    return;
+  }
+
+  WiFiClient client;
+  if (!client.connect(SERVER_HOST, SERVER_PORT, 800)) {
+    Serial.println("[WROOM] No se pudo conectar al servidor para /disparar-camara.");
+    return;
+  }
+
+  client.printf("POST %s HTTP/1.1\r\n", SERVER_CAM_TRIGGER);
+  client.printf("Host: %s:%u\r\n", SERVER_HOST, SERVER_PORT);
+  client.print("Content-Length: 0\r\n");
+  client.print("Connection: close\r\n\r\n");
+
+  unsigned long tWait = millis();
+  while (client.connected() && !client.available() && (millis() - tWait < 400)) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  if (client.available()) {
+    String status = client.readStringUntil('\n');
+    status.trim();
+    Serial.printf("[WROOM] Disparo remoto en servidor -> %s\n", status.c_str());
+  }
+  client.stop();
+}
+
 void enviarDisparoCamara() {
   Serial.printf("[WROOM] Activando pulso digital hacia ESP32-S3-CAM (GPIO %d)...\n", TRIGGER_CAM_PIN);
+  unsigned long tInicio = millis();
   digitalWrite(TRIGGER_CAM_PIN, HIGH);
-  vTaskDelay(pdMS_TO_TICKS(500));  // 500 ms: margen amplio para que la S3-CAM detecte el flanco
+  notificarDisparoCamaraServidor();
+  unsigned long transcurrido = millis() - tInicio;
+  if (transcurrido < 500) {
+    vTaskDelay(pdMS_TO_TICKS(500 - transcurrido));  // 500 ms: margen amplio para detección de flanco
+  }
   digitalWrite(TRIGGER_CAM_PIN, LOW);
+  camaraDisparadaEnCiclo = true;
   Serial.println("[WROOM] Pulso finalizado.");
 }
 
@@ -541,8 +957,10 @@ void actualizarPantalla() {
 void ejecutarMuestreo() {
   Serial.println("[FSM] -> Entrando a estado MUESTREO.");
   
-  // 1. Activar pulso digital en GPIO para disparar ESP32-S3-CAM
-  enviarDisparoCamara();
+  // 1. Disparar ESP32-S3-CAM si no se disparó justo al terminar la captura de voz
+  if (!camaraDisparadaEnCiclo) {
+    enviarDisparoCamara();
+  }
 
   // 2. Disparar tarea DSP en Core 1 mediante semáforo
   xSemaphoreGive(semDispararDSP);
@@ -709,6 +1127,61 @@ String extraerCampoJsonDeStream(WiFiClient& client, const char* claveObjetivo, u
   return valor;
 }
 
+// Extrae todo el body JSON como string crudo para buscar múltiples campos
+String leerBodyHTTP(WiFiClient& client, unsigned long timeoutMs) {
+  String body = "";
+  body.reserve(4096);
+  unsigned long ultimoDato = millis();
+
+  while ((client.connected() || client.available()) && (millis() - ultimoDato) < timeoutMs) {
+    if (client.available()) {
+      char c = (char)client.read();
+      ultimoDato = millis();
+      if (body.length() < 4000) {
+        body += c;
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+  return body;
+}
+
+// Extrae un campo string de un JSON ya leído
+String extraerCampoDeJson(const String& json, const char* clave) {
+  String patron = "\"";
+  patron += clave;
+  patron += "\"";
+  int idx = json.indexOf(patron);
+  if (idx < 0) return "";
+
+  int colon = json.indexOf(':', idx + patron.length());
+  if (colon < 0) return "";
+
+  int startQuote = json.indexOf('"', colon + 1);
+  if (startQuote < 0) return "";
+
+  String valor = "";
+  bool escaped = false;
+  for (int i = startQuote + 1; i < (int)json.length(); i++) {
+    char c = json[i];
+    if (escaped) {
+      if (c == 'n') valor += '\n';
+      else if (c == 'r') {}
+      else if (c == 't') valor += ' ';
+      else valor += c;
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      break;
+    } else {
+      valor += c;
+    }
+  }
+  return valor;
+}
+
 // --- ETAPA: ENVÍO HTTP REAL (AUDIO WAV + MÉTRICAS FFT A /auditar) ---
 void ejecutarEnvioHTTP() {
   Serial.println("[FSM] -> Entrando a estado ENVIO HTTP.");
@@ -781,7 +1254,7 @@ void ejecutarEnvioHTTP() {
     }
     client.print(jsonSuffix);
 
-    // Esperar respuesta del servidor (STT + Gemini + gTTS puede tomar varios segundos)
+    // Esperar respuesta del servidor (STT + Gemini + TTS puede tomar varios segundos)
     unsigned long waitStart = millis();
     while (client.connected() && !client.available() && (millis() - waitStart < 25000)) {
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -804,7 +1277,8 @@ void ejecutarEnvioHTTP() {
         if (hLine == "\r" || hLine.length() == 0) break;
       }
 
-      resumenOledServidor = extraerCampoJsonDeStream(client, "resumen_oled", 5000);
+      // Extraer resumen_oled del JSON (el audio del veredicto se reproduce por streaming desde /veredicto-wav)
+      extraerResumenYAudioDeStream(client, &resumenOledServidor, NULL, 0, NULL, 15000);
       if (resumenOledServidor.length() > 0) {
         Serial.println("[HTTP] Resumen OLED recibido:");
         Serial.println(resumenOledServidor);
@@ -835,7 +1309,7 @@ void ejecutarEnvioHTTP() {
   }
 }
 
-// --- ETAPA: RESULTADO (VEREDICTO EN OLED DURANTE 4 SEGUNDOS) ---
+// --- ETAPA: RESULTADO (VEREDICTO EN OLED + AUDIO TTS POR SPEAKER) ---
 void mostrarResultadoYFinalizar() {
   Serial.println("[FSM] -> Entrando a estado RESULTADO (Dictamen).");
 
@@ -877,11 +1351,30 @@ void mostrarResultadoYFinalizar() {
 
   display.setTextSize(1);
   display.setCursor(4, 55);
-  display.println("Regresando a Standby...");
+  display.println(ultimoHttpOk ? "Hablando veredicto..." : "Modo local (sin red)");
   display.display();
 
-  // Requisito estricto: mostrar veredicto durante 4 segundos usando vTaskDelay (sin delay())
-  vTaskDelay(pdMS_TO_TICKS(4000));
+  unsigned long inicioDictamen = millis();
+
+  // *** REPRODUCIR RESUMEN DEL VEREDICTO POR MAX98357A EN STREAMING ***
+  if (ultimoHttpOk) {
+    Serial.println("[RESULTADO] Reproduciendo resumen del veredicto por speaker...");
+    reproducirWavDesdeEndpoint(SERVER_VEREDICTO_WAV);
+  }
+
+  // Garantizar al menos 4 segundos visibles en pantalla para leer el dictamen
+  unsigned long transcurridoDictamen = millis() - inicioDictamen;
+  if (transcurridoDictamen < 4000) {
+    vTaskDelay(pdMS_TO_TICKS(4000 - transcurridoDictamen));
+  }
+
+  // Mostrar mensaje de regreso
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(4, 28);
+  display.println("Regresando a Standby...");
+  display.display();
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
   Serial.println("[FSM] Tiempo de dictamen cumplido. Regresando a STANDBY.");
 
@@ -889,6 +1382,7 @@ void mostrarResultadoYFinalizar() {
   audioListo = false;
   muestreoListo = false;
   httpListo = false;
+  camaraDisparadaEnCiclo = false;
 
   estadoActual = STANDBY;
   actualizarPantalla();
@@ -929,7 +1423,7 @@ void setup() {
     1                   // Fijada a Core 1
   );
 
-  // Reservar buffer de audio PCM (4s @ 8000Hz 16-bit = 64KB) antes de iniciar Wi-Fi
+  // Reservar buffer de audio PCM (4s @ 8000Hz 16-bit = 64KB, compartido con TTS)
   audioPCM = (int16_t*)malloc(AUDIO_MAX_SAMPLES * sizeof(int16_t));
   if (audioPCM == NULL) {
     Serial.println("[WARN] No se pudo reservar buffer de audio en heap.");
@@ -951,6 +1445,9 @@ void setup() {
   );
   Serial.println("[SETUP] Microfono I2S INMP441 y Modulo DSP inicializados.");
 
+  // Inicializar amplificador MAX98357A (I2S Speaker)
+  initI2SSpeaker();
+
   // Iniciar conexión Wi-Fi en segundo plano
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -959,26 +1456,65 @@ void setup() {
   memset(barHistory, 0, sizeof(barHistory));
   
   actualizarPantalla();
+
+  // Mostrar mensaje de bienvenida en OLED mientras se conecta Wi-Fi
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 5);
+  display.println("SISTEMA AUDITORIA");
+  display.setCursor(16, 18);
+  display.println("ELECTRICA v2.0");
+  display.drawLine(0, 28, 128, 28, SSD1306_WHITE);
+  display.setCursor(4, 33);
+  display.println("Conectando Wi-Fi...");
+  display.setCursor(4, 46);
+  display.println("Esperando saludo IA");
+  display.display();
 }
 
 // --- LOOP PRINCIPAL (CONTROL DE LA MÁQUINA DE ESTADOS) ---
 void loop() {
   switch (estadoActual) {
     case STANDBY: {
+      // Saludo de bienvenida de la IA al estar en STANDBY con Wi-Fi listo
+      if (!saludoReproducido && intentosSaludo < 3 && WiFi.status() == WL_CONNECTED &&
+          (intentosSaludo == 0 || (millis() - ultimoIntentoSaludoMs) > 5000)) {
+        Serial.println("[FSM] Wi-Fi conectado. Solicitando saludo de la IA...");
+        intentosSaludo++;
+        ultimoIntentoSaludoMs = millis();
+
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(4, 5);
+        display.println("BIENVENIDO!");
+        display.drawLine(0, 15, 128, 15, SSD1306_WHITE);
+        display.setCursor(4, 20);
+        display.println("La IA te saluda...");
+        display.drawBitmap(44, 28, epd_bitmap_spidy, 40, 40, SSD1306_WHITE);
+        display.display();
+
+        if (solicitarSaludoServidor()) {
+          saludoReproducido = true;
+        }
+        actualizarPantalla();
+      }
+
       // El botón físico ÚNICAMENTE tiene efecto en este estado
       int lecturaBoton = digitalRead(BOTON_PIN);
-      
+
       if (lecturaBoton != estadoBotonAnterior) {
         ultimoTiempoRebote = millis();
       }
-      
+
       if ((millis() - ultimoTiempoRebote) > retardoRebote) {
         if (lecturaBoton == LOW) {
           Serial.println("[FSM] Boton presionado: Saliendo de STANDBY -> CAPTURA_VOZ");
-          
           audioListo = false;
           muestreoListo = false;
           httpListo = false;
+          camaraDisparadaEnCiclo = false;
 
           i2s_zero_dma_buffer(I2S_PORT);
           audioSampleIndex = 0;
@@ -988,7 +1524,7 @@ void loop() {
           estadoActual = CAPTURA_VOZ;
           inicioCapturaVoz = millis(); // Inicia el cronómetro de escucha
           actualizarPantalla();
-          
+
           // Esperar a que se libere el botón (sin bloquear FreeRTOS)
           while (digitalRead(BOTON_PIN) == LOW) {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -999,30 +1535,28 @@ void loop() {
       vTaskDelay(pdMS_TO_TICKS(10));
       break;
     }
-
     case CAPTURA_VOZ: {
       unsigned long transcurrido = millis() - inicioCapturaVoz;
-
       if (transcurrido < TIEMPO_ESCUCHA_MS) {
         // Sigue dentro de los 4 segundos de escucha
         dibujarPantallaMicrofono(TIEMPO_ESCUCHA_MS - transcurrido);
       } else {
-        // Se cumplió el tiempo: detener captura de audio y avanzar a MUESTREO
+        // Se cumplió el tiempo: detener captura de audio y disparar cámara de inmediato
         grabandoAudio = false;
         vTaskDelay(pdMS_TO_TICKS(60));
-        Serial.printf("[FSM] Tiempo de escucha finalizado (%u muestras capturadas) -> MUESTREO\n",
-                      (unsigned int)audioSampleIndex);
+        Serial.printf("[FSM] Tiempo de escucha finalizado (%u muestras capturadas) -> MUESTREO\n", (unsigned int)audioSampleIndex);
         audioListo = true;
         if (semFSM != NULL) {
           xSemaphoreGive(semFSM);
         }
-
         display.clearDisplay();
         display.setTextSize(1);
         display.setCursor(16, 28);
         display.println("PREGUNTA CAPTURADA");
         display.display();
-        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // Disparar la cámara inmediatamente después de capturar la voz (superpuesto al mensaje)
+        enviarDisparoCamara();
 
         estadoActual = MUESTREO;
         actualizarPantalla();
@@ -1030,10 +1564,8 @@ void loop() {
       vTaskDelay(pdMS_TO_TICKS(40));
       break;
     }
-
     case MUESTREO: {
       ejecutarMuestreo();
-      
       // Al terminar el muestreo (muestreoListo == true), avanza automáticamente a ENVIO_HTTP
       if (muestreoListo) {
         Serial.println("[FSM] Avanzando automaticamente: MUESTREO -> ENVIO_HTTP");
@@ -1042,10 +1574,8 @@ void loop() {
       }
       break;
     }
-
     case ENVIO_HTTP: {
       ejecutarEnvioHTTP();
-      
       // Al recibir la respuesta HTTP (httpListo == true), avanza automáticamente a RESULTADO
       if (httpListo) {
         Serial.println("[FSM] Avanzando automaticamente: ENVIO_HTTP -> RESULTADO");
@@ -1054,10 +1584,9 @@ void loop() {
       }
       break;
     }
-
     case RESULTADO: {
       mostrarResultadoYFinalizar();
-      // Regresa automáticamente a STANDBY tras los 4 segundos
+      // Regresa automáticamente a STANDBY tras reproducir el audio (lo hace mostrarResultadoYFinalizar)
       break;
     }
   }

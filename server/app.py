@@ -22,6 +22,9 @@ Pipeline de Inteligencia Artificial:
 import os
 import io
 import json
+import time
+import wave
+import struct
 import base64
 import asyncio
 from datetime import datetime
@@ -31,7 +34,7 @@ from typing import Optional, Tuple
 import requests as http_requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFont
@@ -70,9 +73,29 @@ state = {
     "audio_consulta_base64": None,# Audio WAV captado por el micrófono del ESP32-WROOM
     "veredicto": None,            # Análisis completo de Gemini
     "resumen_oled": None,         # Texto corto (2-3 líneas) para pantalla OLED
-    "audio_tts_base64": None,     # Audio de respuesta en Base64 (gTTS)
+    "resumen_voz": None,          # Resumen hablado del veredicto para el ESP32
+    "audio_tts_base64": None,     # Audio de respuesta en Base64 (WAV)
+    "audio_tts_wav": None,        # Bytes WAV crudos para streaming al ESP32
+    "saludo_wav": None,           # Cache de saludo WAV para arranque rápido
     "veredicto_ts": None,
 }
+
+# ── Sincronización de disparo de cámara y ráfaga ────────────────────────────
+cam_trigger_id: int = 0
+cam_disparo_ts: float = 0.0
+cam_condition: Optional[asyncio.Condition] = None
+cam_rafaga_lista: Optional[asyncio.Event] = None
+
+
+def _ensure_cam_sync() -> Tuple[asyncio.Condition, asyncio.Event]:
+    """Inicializa primitivas asyncio en el event loop activo."""
+    global cam_condition, cam_rafaga_lista
+    if cam_condition is None:
+        cam_condition = asyncio.Condition()
+    if cam_rafaga_lista is None:
+        cam_rafaga_lista = asyncio.Event()
+        cam_rafaga_lista.set()
+    return cam_condition, cam_rafaga_lista
 
 # ── WebSocket Manager ───────────────────────────────────────────────────────
 class ConnectionManager:
@@ -343,12 +366,12 @@ def generar_diagnostico_ia(
     consulta_usuario: str,
     etiqueta_visual: str,
     fft: dict
-) -> Tuple[str, str]:
+) -> Tuple[str, str, str]:
     """
     Envía a Gemini la consulta, la etiqueta visual de YOLOv8 y las métricas
     espectrales de la FFT (fundamental, h3, h5, h7, THD).
     Instruye al modelo a determinar si existe coincidencia o anomalía.
-    Devuelve: (veredicto_completo, resumen_oled_para_esp32)
+    Devuelve: (veredicto_completo, resumen_oled_para_esp32, resumen_voz_para_speaker)
     """
     pregunta = consulta_usuario or "¿El equipo funciona en condiciones normales y corresponde a lo observado?"
 
@@ -371,7 +394,8 @@ def generar_diagnostico_ia(
         "3. Responde a la duda específica del usuario con tono técnico pero conciso.\n\n"
         "DEBES RESPONDER EN FORMATO JSON ESTRICTO con la siguiente estructura:\n"
         "{\n"
-        '  "veredicto_completo": "Explicación clara de 2 o 3 párrafos para el dashboard web y lectura por voz indicando el estado del equipo, si hay anomalía y la recomendación.",\n'
+        '  "veredicto_completo": "Explicación clara de 2 o 3 párrafos para el dashboard web indicando el estado del equipo, si hay anomalía y la recomendación.",\n'
+        '  "resumen_voz": "Resumen hablado natural y claro de 1 o 2 oraciones (máximo 35 palabras) de lo que dice el veredicto completo, sin símbolos ni asteriscos, listo para leerse en voz alta.",\n'
         '  "resumen_oled": "TEXTO MUY CORTO EN MAYÚSCULAS DE MÁXIMO 3 LÍNEAS Y 20 CARACTERES POR LÍNEA PARA LA PANTALLA OLED DEL ESP32 (Ejemplo: BOMBILLO: NORMAL\\nTHD: 1.2% OK\\nSIN ANOMALIA)"\n'
         "}"
     )
@@ -387,37 +411,123 @@ def generar_diagnostico_ia(
         data = json.loads(limpio)
         veredicto = data.get("veredicto_completo", resp_text)
         oled = data.get("resumen_oled", f"{etiqueta_visual}\nTHD: {fft['thd']:.1f}%\nESTADO OK")
-        return veredicto, oled
+        resumen_voz = data.get("resumen_voz", "")
+        return veredicto, oled, resumen_voz
     except Exception as e:
         print(f"[WARN] Error parseando respuesta JSON de Gemini: {e}")
         # Si falló el parseo JSON, generar respuesta básica estructurada
-        veredicto = f"Diagnóstico: Para la carga {etiqueta_visual} con THD del {fft['thd']:.2f}%, el sistema ha registrado las mediciones armónicas satisfactoriamente."
+        veredicto = f"Diagnóstico: Para la carga {etiqueta_visual} con THD del {fft['thd']:.2f} por ciento, el sistema ha registrado las mediciones armónicas satisfactoriamente."
         oled = f"{etiqueta_visual[:12]}\nTHD:{fft['thd']:.1f}%\nAUDITADO"
-        return veredicto, oled
+        return veredicto, oled, veredicto
 
 
 # ── Módulo 4: Conversión de Texto a Audio (gTTS) ───────────────────────────
-def sintetizar_audio_gtts(texto: str) -> str:
+def _mp3_to_wav_pcm16(mp3_bytes: bytes, target_sr: int = 8000) -> bytes:
     """
-    Convierte el texto del veredicto a audio MP3 usando gTTS
-    y lo retorna codificado en Base64.
+    Convierte audio MP3 (bytes) a WAV PCM 16-bit mono al sample rate indicado.
+    Usa miniaudio (sin dependencias externas), con fallback a pydub o ffmpeg.
     """
     try:
-        # Tomar las primeras dos oraciones para un audio fluido y de tamaño óptimo
-        texto_limpio = texto.replace("*", "").replace("#", "").strip()
-        oraciones = texto_limpio.split(".")
-        texto_locutar = ". ".join(oraciones[:2]) + "." if len(oraciones) > 1 else texto_limpio
-        if len(texto_locutar) < 10:
-            texto_locutar = texto_limpio[:200]
+        import miniaudio
+        decoded = miniaudio.decode(
+            mp3_bytes,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=target_sr,
+        )
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(target_sr)
+            wf.writeframes(decoded.samples.tobytes())
+        return wav_buf.getvalue()
+    except Exception as e:
+        print(f"[INFO] miniaudio no disponible ({e}), intentando con pydub/ffmpeg...")
+
+    try:
+        from pydub import AudioSegment
+        seg = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
+        seg = seg.set_channels(1).set_frame_rate(target_sr).set_sample_width(2)
+        wav_buf = io.BytesIO()
+        seg.export(wav_buf, format="wav")
+        return wav_buf.getvalue()
+    except Exception as e:
+        print(f"[INFO] pydub no disponible ({e}), intentando con ffmpeg...")
+
+    # Fallback: ffmpeg por subprocess
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+        tmp_mp3.write(mp3_bytes)
+        tmp_mp3_path = tmp_mp3.name
+    tmp_wav_path = tmp_mp3_path.replace(".mp3", ".wav")
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", tmp_mp3_path,
+            "-ar", str(target_sr), "-ac", "1", "-sample_fmt", "s16",
+            tmp_wav_path
+        ], capture_output=True, check=True)
+        with open(tmp_wav_path, "rb") as f:
+            return f.read()
+    except Exception as e2:
+        print(f"[WARN] ffmpeg tampoco disponible ({e2}). Generando WAV sintético.")
+        return _generar_wav_sintetico("Audio no disponible", target_sr)
+    finally:
+        for p in [tmp_mp3_path, tmp_wav_path]:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+
+def _generar_wav_sintetico(texto: str, sr: int = 16000) -> bytes:
+    """Genera un WAV PCM 16-bit mono silencioso (0.3s) como fallback seguro sin pitidos fuertes."""
+    n_samples = int(sr * 0.3)
+    wav_buf = io.BytesIO()
+    with wave.open(wav_buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(b"\x00\x00" * n_samples)
+    return wav_buf.getvalue()
+
+
+def sintetizar_audio_wav_bytes(texto: str, target_sr: int = 16000) -> bytes:
+    """
+    Convierte el texto a audio WAV PCM 16-bit mono (16 kHz por defecto)
+    usando gTTS (MP3) + miniaudio (WAV PCM) para reproducción directa en MAX98357A.
+    """
+    try:
+        texto_limpio = texto.replace("*", "").replace("#", "").replace("•", "").strip()
+        oraciones = [o.strip() for o in texto_limpio.split(".") if o.strip()]
+        if len(oraciones) > 2:
+            texto_locutar = ". ".join(oraciones[:2]) + "."
+        else:
+            texto_locutar = texto_limpio
+
+        if len(texto_locutar) > 260:
+            texto_locutar = texto_locutar[:260].rsplit(" ", 1)[0] + "."
 
         tts = gTTS(text=texto_locutar, lang="es", slow=False)
         fp = io.BytesIO()
         tts.write_to_fp(fp)
-        audio_bytes = fp.getvalue()
-        return base64.b64encode(audio_bytes).decode("utf-8")
+        mp3_bytes = fp.getvalue()
+
+        wav_bytes = _mp3_to_wav_pcm16(mp3_bytes, target_sr=target_sr)
+        dur = max(0, len(wav_bytes) - 44) / (target_sr * 2)
+        print(f"[TTS] Audio WAV generado: {len(wav_bytes)} bytes ({dur:.1f}s @ {target_sr}Hz) -> '{texto_locutar}'")
+        return wav_bytes
     except Exception as e:
         print(f"[WARN] Error sintetizando con gTTS: {e}")
+        return b""
+
+
+def sintetizar_audio_gtts(texto: str) -> str:
+    """Retorna el audio WAV PCM 16-bit mono 16kHz codificado en Base64."""
+    wav_bytes = sintetizar_audio_wav_bytes(texto, target_sr=16000)
+    if not wav_bytes:
         return ""
+    return base64.b64encode(wav_bytes).decode("utf-8")
 
 
 # ── Endpoints HTTP ──────────────────────────────────────────────────────────
@@ -442,6 +552,56 @@ async def get_estado():
     return JSONResponse(_snapshot())
 
 
+@app.post("/disparar-camara")
+async def disparar_camara():
+    """
+    Registra un disparo solicitado por el ESP32-WROOM al finalizar el muestreo de voz.
+    Despierta de inmediato al ESP32-S3-CAM conectado a /cam-esperar.
+    """
+    global cam_trigger_id, cam_disparo_ts
+    cond, rafaga_evt = _ensure_cam_sync()
+    async with cond:
+        cam_trigger_id += 1
+        cam_disparo_ts = time.monotonic()
+        rafaga_evt.clear()
+        cond.notify_all()
+
+    await manager.broadcast({
+        "tipo": "cam_disparo",
+        "trigger_id": cam_trigger_id,
+    })
+    return {"ok": True, "trigger_id": cam_trigger_id}
+
+
+@app.get("/cam-estado")
+async def cam_estado():
+    """Devuelve el último ID de disparo de cámara registrado."""
+    _ensure_cam_sync()
+    return {"trigger_id": cam_trigger_id}
+
+
+@app.get("/cam-esperar")
+async def cam_esperar(ultimo_id: int = 0, timeout: float = 8.0):
+    """
+    Long-polling para ESP32-S3-CAM: espera hasta `timeout` segundos a que
+    exista un trigger_id > ultimo_id y responde de inmediato cuando ocurre.
+    """
+    cond, _ = _ensure_cam_sync()
+    wait_s = max(1.0, min(float(timeout), 15.0))
+    if cam_trigger_id > ultimo_id:
+        return {"trigger": True, "trigger_id": cam_trigger_id}
+
+    try:
+        async with cond:
+            await asyncio.wait_for(
+                cond.wait_for(lambda: cam_trigger_id > ultimo_id),
+                timeout=wait_s,
+            )
+        return {"trigger": True, "trigger_id": cam_trigger_id}
+    except asyncio.TimeoutError:
+        return {"trigger": False, "trigger_id": cam_trigger_id}
+
+
 @app.post("/foto-stream")
 async def recibir_foto_stream(
     file: UploadFile = File(...),
@@ -454,6 +614,10 @@ async def recibir_foto_stream(
     de inmediato vía WebSocket para simular video en tiempo real.
     En el cuadro final (final=1), ejecuta YOLOv8 y guarda la imagen anotada.
     """
+    _, rafaga_evt = _ensure_cam_sync()
+    if frame == 1 and final != 1:
+        rafaga_evt.clear()
+
     contenido = await file.read()
     ts_ms = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     img_b64 = base64.b64encode(contenido).decode("utf-8")
@@ -475,18 +639,20 @@ async def recibir_foto_stream(
         ruta_anotada = FOTOS_DIR / nombre_anotada
         ruta_orig.write_bytes(contenido)
 
-        etiqueta, detalle = procesar_imagen_yolo(ruta_orig, ruta_anotada)
+        etiqueta, detalle = await asyncio.to_thread(procesar_imagen_yolo, ruta_orig, ruta_anotada)
 
         state["ultima_foto_path"] = str(ruta_anotada)
         state["ultima_foto_ts"] = ts_ms
         state["etiqueta_visual"] = etiqueta
         state["yolo_detalle"] = detalle
+        rafaga_evt.set()
 
         await manager.broadcast(_snapshot())
 
         return {
             "ok": True,
             "final": True,
+            "trigger_id": cam_trigger_id,
             "etiqueta_visual": etiqueta,
             "detalle": detalle,
         }
@@ -532,8 +698,70 @@ async def recibir_foto(file: UploadFile = File(...)):
     }
 
 
+def _obtener_saludo_wav() -> bytes:
+    """Genera (y cachea en memoria) el saludo de bienvenida en WAV PCM 16kHz."""
+    if state["saludo_wav"]:
+        return state["saludo_wav"]
+    texto_saludo = (
+        "¡Hola! Bienvenido al sistema de auditoría eléctrica. "
+        "Estoy listo para ayudarte, presiona el botón para comenzar."
+    )
+    wav_bytes = sintetizar_audio_wav_bytes(texto_saludo, target_sr=16000)
+    if wav_bytes:
+        state["saludo_wav"] = wav_bytes
+    return wav_bytes
+
+
+@app.get("/saludo-wav")
+async def saludo_wav():
+    """Entrega el saludo de bienvenida directamente como binario audio/wav para streaming I2S."""
+    wav_bytes = _obtener_saludo_wav()
+    if wav_bytes:
+        return Response(content=wav_bytes, media_type="audio/wav",
+                        headers={"Content-Length": str(len(wav_bytes))})
+    return JSONResponse({"ok": False, "error": "No se pudo sintetizar saludo"}, status_code=500)
+
+
+@app.get("/veredicto-wav")
+async def veredicto_wav():
+    """Entrega el resumen hablado del último veredicto como binario audio/wav para streaming I2S."""
+    wav_bytes = state.get("audio_tts_wav")
+    if wav_bytes:
+        return Response(content=wav_bytes, media_type="audio/wav",
+                        headers={"Content-Length": str(len(wav_bytes))})
+    return JSONResponse({"ok": False, "error": "No hay audio de veredicto aún"}, status_code=404)
+
+
+@app.get("/saludo-audio")
+async def saludo_audio():
+    """
+    Genera un audio de saludo de bienvenida en WAV PCM 16-bit mono 16kHz
+    para que el ESP32 lo reproduzca por el MAX98357A al arrancar.
+    """
+    texto_saludo = (
+        "¡Hola! Bienvenido al sistema de auditoría eléctrica. "
+        "Estoy listo para ayudarte, presiona el botón para comenzar."
+    )
+
+    wav_bytes = _obtener_saludo_wav()
+    audio_b64 = base64.b64encode(wav_bytes).decode("utf-8") if wav_bytes else ""
+
+    if audio_b64:
+        return JSONResponse({
+            "ok": True,
+            "mensaje": texto_saludo,
+            "audio_base64": audio_b64
+        })
+    else:
+        return JSONResponse({
+            "ok": False,
+            "mensaje": texto_saludo,
+            "audio_base64": ""
+        }, status_code=500)
+
+
 @app.post("/auditar")
-async def auditar(datos: DatosFFT):
+async def auditar(datos: DatosFFT, solo_resumen: int = 0):
     """
     Endpoint invocado por el ESP32-WROOM con la FFT y el audio de voz.
     1. Decodifica el audio y lo transcribe con Google Speech-to-Text.
@@ -542,9 +770,9 @@ async def auditar(datos: DatosFFT):
        - Carga detectada por YOLOv8
        - Métricas FFT (fundamental, armónicos 3/5/7 y THD)
        Determinando coincidencia o anomalía.
-    3. Convierte la respuesta a voz usando gTTS.
+    3. Convierte la respuesta a voz usando gTTS (en formato WAV PCM para MAX98357A).
     4. Actualiza el dashboard web.
-    5. Devuelve al ESP32-WROOM el texto resumido (pantalla OLED) y el audio en Base64.
+    5. Devuelve al ESP32-WROOM el texto resumido (pantalla OLED) y el audio WAV en Base64.
     """
     # 1. Registrar FFT en el estado
     fft = {
@@ -568,11 +796,19 @@ async def auditar(datos: DatosFFT):
     state["transcripcion"] = transcripcion or "Consulta por voz sin audio detectable"
     await manager.broadcast(_snapshot())
 
-    # 3. Obtener etiqueta visual (o valor por defecto si aún no han tomado foto)
+    # 3. Esperar brevemente si hay una ráfaga reciente de cámara en progreso
+    _, rafaga_evt = _ensure_cam_sync()
+    if not rafaga_evt.is_set() and (time.monotonic() - cam_disparo_ts) < 12.0:
+        try:
+            await asyncio.wait_for(rafaga_evt.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            print("[WARN] Timeout esperando cierre de ráfaga de cámara antes de auditar.")
+
+    # Obtener etiqueta visual (o valor por defecto si aún no han tomado foto)
     etiqueta = state.get("etiqueta_visual") or "CARGA NO IDENTIFICADA (SIN FOTO)"
 
     # 4. Generar Veredicto con Gemini
-    veredicto, resumen_oled = generar_diagnostico_ia(
+    veredicto, resumen_oled, resumen_voz = generar_diagnostico_ia(
         consulta_usuario=state["transcripcion"],
         etiqueta_visual=etiqueta,
         fft=fft
@@ -580,23 +816,27 @@ async def auditar(datos: DatosFFT):
 
     state["veredicto"] = veredicto
     state["resumen_oled"] = resumen_oled
+    state["resumen_voz"] = resumen_voz or veredicto
     state["veredicto_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 5. Generar audio con gTTS
-    audio_tts_b64 = sintetizar_audio_gtts(veredicto)
+    # 5. Generar audio WAV PCM 16kHz con gTTS + miniaudio (resumen hablado del veredicto)
+    wav_bytes = sintetizar_audio_wav_bytes(state["resumen_voz"], target_sr=16000)
+    state["audio_tts_wav"] = wav_bytes if wav_bytes else None
+    audio_tts_b64 = base64.b64encode(wav_bytes).decode("utf-8") if wav_bytes else ""
     state["audio_tts_base64"] = audio_tts_b64
 
     # 6. Actualizar dashboard web completo vía WebSocket
     await manager.broadcast(_snapshot())
 
-    # 7. Responder al ESP32-WROOM
+    # 7. Responder al ESP32-WROOM (si solo_resumen=1, el ESP32 descargará /veredicto-wav en streaming)
     return {
         "ok": True,
         "etiqueta_visual": etiqueta,
         "transcripcion": state["transcripcion"],
         "veredicto": veredicto,
         "resumen_oled": resumen_oled,
-        "audio_base64": audio_tts_b64,
+        "resumen_voz": state["resumen_voz"],
+        "audio_base64": "" if solo_resumen else audio_tts_b64,
         "fft": fft
     }
 

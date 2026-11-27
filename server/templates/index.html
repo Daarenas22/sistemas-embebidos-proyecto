@@ -409,8 +409,15 @@
 
     let ws;
     let reconnectTimer;
+    let isStreamingFrames = false;
+    let streamBaseFotoTs = null;
+    let lastKnownFotoTs = null;
 
     function renderLiveFrame(msg) {
+        if (!isStreamingFrames) {
+            streamBaseFotoTs = lastKnownFotoTs;
+            isStreamingFrames = true;
+        }
         let img = fotoContainer.querySelector('img');
         if (!img) {
             fotoContainer.innerHTML = `<img id="liveFotoImg" alt="Video en vivo">`;
@@ -419,12 +426,22 @@
         img.src = `data:image/jpeg;base64,${msg.img_b64}`;
         img.dataset.ts = msg.ts || '';
         yoloBadge.textContent = `EN VIVO ${msg.frame}/${msg.total}`;
-        yoloDetalle.textContent = 'Transmitiendo ráfaga en tiempo real…';
+        yoloDetalle.textContent = msg.frame >= msg.total
+            ? 'Procesando detección YOLOv8…'
+            : 'Transmitiendo ráfaga en tiempo real…';
         fotoTs.textContent = `Frame ${msg.frame} de ${msg.total}`;
     }
 
     function renderFoto(state) {
         if (state.ultima_foto) {
+            if (isStreamingFrames && state.ultima_foto_ts === streamBaseFotoTs) {
+                return;
+            }
+            if (isStreamingFrames && state.ultima_foto_ts && state.ultima_foto_ts !== streamBaseFotoTs) {
+                isStreamingFrames = false;
+            }
+            lastKnownFotoTs = state.ultima_foto_ts || null;
+
             let currentImg = fotoContainer.querySelector('img');
             if (!currentImg) {
                 fotoContainer.innerHTML =
@@ -436,7 +453,7 @@
                 fotoTs.textContent = `Captura: ${state.ultima_foto_ts || ''}`;
             }
         }
-        if (state.etiqueta_visual) {
+        if (state.etiqueta_visual && !isStreamingFrames) {
             yoloBadge.textContent = state.etiqueta_visual;
             yoloDetalle.textContent = state.yolo_detalle || `Detectado: ${state.etiqueta_visual}`;
         }
@@ -497,7 +514,7 @@
             }
         }
         if (state.audio_tts_base64) {
-            const audioSrc = `data:audio/mp3;base64,${state.audio_tts_base64}`;
+            const audioSrc = `data:audio/wav;base64,${state.audio_tts_base64}`;
             if (audioPlayer.src !== audioSrc) {
                 audioPlayer.src = audioSrc;
                 audioContainer.style.display = 'flex';
@@ -535,6 +552,9 @@
                 const msg = JSON.parse(e.data);
                 if (msg.tipo === 'frame') {
                     renderLiveFrame(msg);
+                } else if (msg.tipo === 'cam_disparo') {
+                    yoloBadge.textContent = 'DISPARANDO…';
+                    yoloDetalle.textContent = 'Capturando ráfaga del ESP32-S3-CAM…';
                 } else {
                     render(msg);
                 }
